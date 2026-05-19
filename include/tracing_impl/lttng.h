@@ -625,6 +625,44 @@ LTTNG_UST_TRACEPOINT_EVENT(
 
 LTTNG_UST_TRACEPOINT_EVENT(
     nccl_ofi_plugin,
+    gin_gdrcopy_begin,
+    LTTNG_UST_TP_ARGS(
+            int, dev,
+            void *, comm,
+            uint32_t, peer_rank,
+            uint16_t, msg_seq_num,
+            void *, request
+    ),
+    LTTNG_UST_TP_FIELDS(
+            lttng_ust_field_integer(int, dev, dev)
+            lttng_ust_field_integer_hex(uint64_t, comm, (uint64_t)comm)
+            lttng_ust_field_integer(uint32_t, peer_rank, peer_rank)
+            lttng_ust_field_integer(uint16_t, msg_seq_num, msg_seq_num)
+            lttng_ust_field_integer_hex(uint64_t, request, (uint64_t)request)
+    )
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(
+    nccl_ofi_plugin,
+    gin_gdrcopy_end,
+    LTTNG_UST_TP_ARGS(
+            int, dev,
+            void *, comm,
+            uint32_t, peer_rank,
+            uint16_t, msg_seq_num,
+            void *, request
+    ),
+    LTTNG_UST_TP_FIELDS(
+            lttng_ust_field_integer(int, dev, dev)
+            lttng_ust_field_integer_hex(uint64_t, comm, (uint64_t)comm)
+            lttng_ust_field_integer(uint32_t, peer_rank, peer_rank)
+            lttng_ust_field_integer(uint16_t, msg_seq_num, msg_seq_num)
+            lttng_ust_field_integer_hex(uint64_t, request, (uint64_t)request)
+    )
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(
+    nccl_ofi_plugin,
     gin_ack_recv,
     LTTNG_UST_TP_ARGS(
             int, dev,
