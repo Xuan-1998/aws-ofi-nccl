@@ -276,9 +276,127 @@ int main(int argc, char *argv[])
 	}
 
 	/* Verification */
-	NCCL_OFI_INFO(NCCL_NET, "Verifying result..");
+	NCCL_OFI_INFO(NCCL_NET, "=== Verifying iput/iputSignal result ===");
 	OFINCCLCHECK(verify_buff(rank, put_buff, send_val));
 	OFINCCLCHECK(verify_buff(rank, put_signal_buff, send_val));
+
+	/*
+	 * iget test: rank 0 registers a buffer filled with a distinct value
+	 * (iget_val=99). Rank 1+ uses iget to read it into a local buffer
+	 * (initialized to 0), then verifies the contents are 99.
+	 * This ensures the data came from the remote read, not stale local
+	 * state or leftover iput data (which uses send_val=42).
+	 */
+	const int iget_val = 99;
+	void *get_src_buff = nullptr;
+	void *get_src_mhandle = nullptr;
+	OFINCCLCHECK(alloc_and_reg_buff(extGin, collComm, SEND_SIZE, buffer_type,
+					(rank == 0) ? iget_val : 0, &get_src_buff,
+					&get_src_mhandle));
+
+	void *get_buff = nullptr;
+	void *get_mhandle = nullptr;
+	OFINCCLCHECK(alloc_and_reg_buff(extGin, collComm, SEND_SIZE, buffer_type, 0, &get_buff,
+					&get_mhandle));
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	if (rank != 0) {
+		std::deque<void *> get_request_deque;
+
+		void *request = nullptr;
+		OFINCCLCHECK(extGin->iget(proxyCtx, 0, 0, get_src_mhandle, SEND_SIZE, 0,
+					  get_mhandle, 0, &request));
+		assert(request != nullptr);
+		get_request_deque.push_back(request);
+
+		while (!get_request_deque.empty()) {
+			OFINCCLCHECK(poll_request_completion(extGin, get_request_deque, collComm,
+							    proxyCtx));
+		}
+
+		NCCL_OFI_INFO(NCCL_NET, "=== Verifying iget result ===");
+		OFINCCLCHECK(verify_buff(rank, get_buff, iget_val));
+	}
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	/*
+	 * iflush correctness test:
+	 * 1. Rank 0 fills its buffer with a distinct value (flush_val=77)
+	 * 2. Rank 1 does iget to read rank 0's buffer into a local buffer
+	 * 3. Rank 1 does iflush to ensure the iget data is visible locally
+	 * 4. Rank 1 verifies the local buffer contains the expected value
+	 *
+	 * This proves iflush fences prior igets — the contract NCCL relies on
+	 * when the GPU kernel issues a flush after reading remote data.
+	 */
+	{
+		const int flush_val = 77; /* distinct from send_val(42) and iget_val(99) */
+		void *flush_src_buff = nullptr;
+		void *flush_src_mhandle = nullptr;
+		OFINCCLCHECK(alloc_and_reg_buff(extGin, collComm, SEND_SIZE, buffer_type,
+						(rank == 0) ? flush_val : 0,
+						&flush_src_buff, &flush_src_mhandle));
+
+		void *flush_dst_buff = nullptr;
+		void *flush_dst_mhandle = nullptr;
+		OFINCCLCHECK(alloc_and_reg_buff(extGin, collComm, SEND_SIZE, buffer_type,
+						0, &flush_dst_buff, &flush_dst_mhandle));
+
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		if (rank == 1) {
+			/* iget: read rank 0's buffer into local buffer */
+			std::deque<void *> get_deque;
+			void *request = nullptr;
+			OFINCCLCHECK(extGin->iget(proxyCtx, 0, 0, flush_src_mhandle,
+						  SEND_SIZE, 0, flush_dst_mhandle, 0,
+						  &request));
+			assert(request != nullptr);
+			get_deque.push_back(request);
+
+			while (!get_deque.empty()) {
+				OFINCCLCHECK(poll_request_completion(extGin, get_deque,
+								    collComm, proxyCtx));
+			}
+
+			/* iflush: fence the iget to ensure data is visible */
+			std::deque<void *> flush_deque;
+			void *flush_request = nullptr;
+			OFINCCLCHECK(extGin->iflush(proxyCtx, 0, flush_dst_mhandle,
+						    0, &flush_request));
+			assert(flush_request != nullptr);
+			flush_deque.push_back(flush_request);
+
+			while (!flush_deque.empty()) {
+				OFINCCLCHECK(poll_request_completion(extGin, flush_deque,
+								    collComm, proxyCtx));
+			}
+
+			/* Verify data is visible after flush */
+			NCCL_OFI_INFO(NCCL_NET, "=== Verifying iflush result ===");
+			OFINCCLCHECK(verify_buff(rank, flush_dst_buff, flush_val));
+		}
+
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		OFINCCLCHECK(extGin->deregMrSym(collComm, flush_src_mhandle));
+		flush_src_mhandle = nullptr;
+		OFINCCLCHECK(extGin->deregMrSym(collComm, flush_dst_mhandle));
+		flush_dst_mhandle = nullptr;
+		OFINCCLCHECK(deallocate_buffer(flush_src_buff, buffer_type));
+		flush_src_buff = nullptr;
+		OFINCCLCHECK(deallocate_buffer(flush_dst_buff, buffer_type));
+		flush_dst_buff = nullptr;
+	}
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	OFINCCLCHECK(extGin->deregMrSym(collComm, get_src_mhandle));
+	get_src_mhandle = nullptr;
+	OFINCCLCHECK(extGin->deregMrSym(collComm, get_mhandle));
+	get_mhandle = nullptr;
 
 	/* Cleanup APIs */
 	OFINCCLCHECK(extGin->deregMrSym(collComm, signal_mhandle));
@@ -305,6 +423,10 @@ int main(int argc, char *argv[])
 	MPI_Finalize();
 
 	/* Clean up local resources */
+	OFINCCLCHECK(deallocate_buffer(get_src_buff, buffer_type));
+	get_src_buff = nullptr;
+	OFINCCLCHECK(deallocate_buffer(get_buff, buffer_type));
+	get_buff = nullptr;
 	OFINCCLCHECK(deallocate_buffer(signal_buf, buffer_type));
 	signal_buf = nullptr;
 	OFINCCLCHECK(deallocate_buffer(put_signal_buff, buffer_type));

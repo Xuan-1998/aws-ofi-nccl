@@ -79,10 +79,21 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 	 * Morph the exported plugin to GDAKI if requested. Shared plugin APIs
 	 * are wired into nccl_ofi_gin_gdaki_plugin at compile time, so we just
 	 * overwrite the exported symbol.
+	 *
+	 * If the user requested GDAKI but the plugin was built against a
+	 * libfabric without FI_EFA_GDA_OPS, fail init rather than silently
+	 * fall back to the proxy path: GDAKI was an explicit opt-in.
 	 */
 	if (nccl_ofi_gin_gdaki_enabled()) {
+#if !HAVE_DECL_FI_EFA_GDA_OPS
+		NCCL_OFI_WARN("OFI_NCCL_GIN_GDAKI=1 set but plugin was built "
+			      "without libfabric FI_EFA_GDA_OPS support "
+			      "(requires libfabric >= 2.3.0); failing init");
+		return ncclInvalidUsage;
+#else
 		NCCL_OFI_INFO(NCCL_NET | NCCL_INIT, "gin: GDAKI mode enabled (OFI_NCCL_GIN_GDAKI=1)");
 		memcpy(&ncclGinPlugin_v13, &nccl_ofi_gin_gdaki_plugin, sizeof(ncclGinPlugin_v13));
+#endif
 	}
 
 	return ncclSuccess;
@@ -280,7 +291,7 @@ ncclResult_t nccl_ofi_gin_closeListen(void *listenComm)
 
 static ncclResult_t nccl_ofi_gin_test(void *collComm, void *request, int *done)
 {
-	auto *req = static_cast<nccl_ofi_rdma_gin_iputsignal_req *>(request);
+	auto *req = static_cast<nccl_ofi_gin_req_t *>(request);
 	int ret = req->test(done);
 	return nccl_net_ofi_retval_translate(ret);
 }
@@ -314,6 +325,24 @@ static ncclResult_t nccl_ofi_gin_iput(void *collComm, uint64_t srcOff, void *src
 	   iputSignal with a zero'd signal address (instead of a write-without-immediate) */
 	return nccl_ofi_gin_iputSignal(collComm, srcOff, srcMhandle, size, dstOff, dstMhandle, rank,
 				       0, nullptr, 0, 0, request);
+}
+
+static ncclResult_t nccl_ofi_gin_iget(void *collComm, uint64_t remoteOff, void *remoteMhandle,
+				      size_t size, uint64_t localOff, void *localMhandle,
+				      uint32_t rank, void **request)
+{
+	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
+	auto *remote_mr = static_cast<nccl_ofi_gin_symm_mr_handle_t *>(remoteMhandle);
+	auto *local_mr = static_cast<nccl_ofi_gin_symm_mr_handle_t *>(localMhandle);
+
+	nccl_ofi_gin_req_t *req = nullptr;
+	int ret = gin_comm->iget(remoteOff, remote_mr, size, localOff, local_mr, rank, &req);
+	if (ret != 0) {
+		return nccl_net_ofi_retval_translate(ret);
+	}
+
+	*request = req;
+	return ncclSuccess;
 }
 
 ncclResult_t nccl_ofi_gin_finalize(void *ctx)
@@ -416,6 +445,30 @@ static ncclResult_t nccl_ofi_gin_iputSignal_v13(void *ginCtx, int context, uint6
 				       signalValue, signalOp, request);
 }
 
+static ncclResult_t nccl_ofi_gin_iget_v13(void *ginCtx, int context, uint64_t remoteOff,
+					  void *remoteMhandle, size_t size, uint64_t localOff,
+					  void *localMhandle, uint32_t rank, void **request)
+{
+	return nccl_ofi_gin_iget(ginCtx, remoteOff, remoteMhandle, size,
+				 localOff, localMhandle, rank, request);
+}
+
+static ncclResult_t nccl_ofi_gin_iflush_v13(void *ginCtx, int context, void *mhandle,
+					    uint32_t rank, void **request)
+{
+	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(ginCtx);
+	auto *mr_handle = static_cast<nccl_ofi_gin_symm_mr_handle_t *>(mhandle);
+
+	nccl_ofi_gin_req_t *req = nullptr;
+	int ret = gin_comm->iflush(mr_handle, rank, &req);
+	if (ret != 0) {
+		return nccl_net_ofi_retval_translate(ret);
+	}
+
+	*request = req;
+	return ncclSuccess;
+}
+
 NCCL_OFI_EXPORT_SYMBOL ncclGin_v11_t ncclGinPlugin_v11 = {
 	/* Since there is no equivalent of NCCL_NET for GIN, currently we don't
 	   have name fixup depending on env var like nvidia_plugin_name_fixup().
@@ -461,8 +514,8 @@ NCCL_OFI_EXPORT_SYMBOL ncclGin_v13_t ncclGinPlugin_v13 = {
 	.closeListen = nccl_ofi_gin_closeListen,
 	.iput = nccl_ofi_gin_iput_v13,
 	.iputSignal = nccl_ofi_gin_iputSignal_v13,
-	.iget = nullptr,
-	.iflush = nullptr,
+	.iget = nccl_ofi_gin_iget_v13,
+	.iflush = nccl_ofi_gin_iflush_v13,
 	.test = nccl_ofi_gin_test,
 	.ginProgress = nccl_ofi_gin_ginProgress,
 	.queryLastError = nullptr,

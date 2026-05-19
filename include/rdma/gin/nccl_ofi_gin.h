@@ -169,6 +169,13 @@ struct nccl_ofi_rdma_gin_symm_mr_handle : public nccl_ofi_gin_symm_mr_handle_t {
 
 	/* Remote MR information for each peer rank */
 	std::vector<gin_remote_mr> remote_mr;
+
+	/* Optional device-visible handle owned by the GDAKI plugin wrapper
+	 * (nccl_ofi_gin_gdaki_mr_handle *). Stored here so deregMrSym can
+	 * free it with only the mhandle in hand — NCCL's ncclGinDeregister
+	 * does not pass ginHandle to deregMrSym. Plain heap memory, no
+	 * libfabric resources. Null when the proxy path is used. */
+	void *gin_device_handle = nullptr;
 };
 
 /**
@@ -247,6 +254,16 @@ public:
 	int get_rank() const
 	{
 		return rank;
+	}
+
+	int get_nranks() const
+	{
+		return nranks;
+	}
+
+	nccl_ofi_gin_allgather_comm &get_ag_comm()
+	{
+		return ag_comm;
 	}
 
 	int get_dev() const
@@ -333,6 +350,26 @@ public:
 		       nccl_ofi_gin_symm_mr_handle_t *dstMhandle, uint32_t rank, uint64_t signalOff,
 		       nccl_ofi_gin_symm_mr_handle_t *signalMhandle, uint64_t signalValue, uint32_t signalOp,
 		       nccl_ofi_gin_req_t **request) override;
+
+	int iget(uint64_t remoteOff, nccl_ofi_gin_symm_mr_handle_t *remoteMhandle,
+		 size_t size, uint64_t localOff, nccl_ofi_gin_symm_mr_handle_t *localMhandle,
+		 uint32_t rank, nccl_ofi_gin_req_t **request) override;
+
+	/**
+	 * Fence prior iget operations to ensure data is visible locally.
+	 *
+	 * Posts a loopback fi_read on each rail from a local GPU buffer into
+	 * a host buffer. PCIe ordering guarantees that completion of the read
+	 * implies all prior NIC writes (from igets) are committed to memory.
+	 *
+	 * @param mhandle: memory handle associated with the flushed region
+	 * @param rank: rank whose prior igets are being fenced
+	 * @param request: request to be returned to caller
+	 *
+	 * @return: 0 on success, non-zero on failure
+	 */
+	int iflush(nccl_ofi_gin_symm_mr_handle_t *mhandle, uint32_t rank,
+		   nccl_ofi_gin_req_t **request) override;
 
 	/**
 	 * Callback for metadata completion.

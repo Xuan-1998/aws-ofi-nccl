@@ -7,6 +7,7 @@
 
 #include "rdma/fabric.h"
 
+#include <array>
 #include <deque>
 #include <stdexcept>
 #include <vector>
@@ -72,6 +73,19 @@ public:
 		return rails[rail_id];
 	}
 
+	/**
+	 * @brief Accessor to the net transport domain backing this GIN EP.
+	 *
+	 * Exposed so GDAKI createContext can reuse the same libfabric domain
+	 * as the proxy path. Same fid_domain → same PD → memory registered
+	 * via extGin->regMrSym produces keys (lkey/rkey) that are valid on
+	 * the GDAKI endpoint opened in createContext.
+	 */
+	nccl_net_ofi_domain_t &get_domain()
+	{
+		return domain;
+	}
+
 	nccl_net_ofi_scheduler *get_scheduler()
 	{
 		return scheduler;
@@ -105,7 +119,6 @@ public:
 	void close_ofi_eps();
 
 	std::mutex ep_lock;
-
 private:
 	nccl_net_ofi_domain_t &domain;
 
@@ -218,28 +231,27 @@ public:
 	 * Get GIN communicator with given comm_id from map. Throw exception if
 	 * not found.
 	 */
-	nccl_ofi_rdma_gin_put_comm &get_comm(uint32_t comm_id)
+	nccl_ofi_rdma_gin_put_comm &get_comm(uint16_t comm_id)
 	{
-		auto it = gin_comms.find(comm_id);
-		if (it == gin_comms.end()) {
+		if (OFI_UNLIKELY(comm_id >= NCCL_GIN_MAX_COMMS || gin_comms[comm_id] == nullptr)) {
 			NCCL_OFI_WARN("Invalid comm_id %d", comm_id);
 			throw std::runtime_error("Failed to find comm_id");
 		}
 
-		return *(it->second);
+		return *gin_comms[comm_id];
 	}
 
 	/**
 	 * Set a GIN communicator with given comm_id in map. Throw exception if
 	 * comm_id already exists.
 	 */
-	void set_comm(uint32_t comm_id, nccl_ofi_rdma_gin_put_comm &comm)
+	void set_comm(uint16_t comm_id, nccl_ofi_rdma_gin_put_comm &comm)
 	{
-		auto it = gin_comms.insert({ comm_id, &comm });
-		if (!it.second) {
+		if (OFI_UNLIKELY(comm_id >= NCCL_GIN_MAX_COMMS || gin_comms[comm_id] != nullptr)) {
 			NCCL_OFI_WARN("Failed to insert duplicate comm_id %d", comm_id);
 			throw std::runtime_error("Failed to insert comm_id");
 		}
+		gin_comms[comm_id] = &comm;
 	}
 
 	nccl_ofi_rdma_gin_ep_t &get_ep()
@@ -255,6 +267,26 @@ public:
 	nccl_ofi_freelist *get_ack_send_fl()
 	{
 		return ack_send_fl.get();
+	}
+
+	void *get_flush_buff() const
+	{
+		return flush_buff;
+	}
+
+	void *get_flush_buff_gpu() const
+	{
+		return flush_buff_gpu;
+	}
+
+	nccl_ofi_gin_mr_handle_t *get_flush_buff_mr_handle() const
+	{
+		return flush_buff_mr_handle;
+	}
+
+	nccl_ofi_gin_mr_handle_t *get_flush_buff_gpu_mr_handle() const
+	{
+		return flush_buff_gpu_mr_handle;
 	}
 
 	/**
@@ -341,43 +373,61 @@ public:
 	}
 
 private:
+	void init_flush_buffers(uint16_t num_rails);
+
+	/* === Tier 1 — accessed every CQ completion and/or iputSignal === */
 	nccl_ofi_gin_ep_holder ep_holder;
 
-	std::unordered_map<uint32_t, nccl_ofi_rdma_gin_put_comm *> gin_comms;
-
-	nccl_ofi_idpool_t comm_id_pool;
-
 	nccl_ofi_rdma_gin_ep_t gin_ep;
+
+	/* Requests pool used by all comms of this resource */
+	// FIXME: Get rid of freelist_deleter and change to embedded
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> req_fl;
+
+	/* Pool of buffers for recv requests */
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> rx_buff_fl;
+
+	/* Reqs for RX buffers */
+	std::vector<nccl_net_ofi_gin_recv_req_t> recv_reqs;
+
+	/* === Tier 2 — accessed on iputSignal / ACK / retry paths === */
+	/* For rail scheduling. Currently we do round-robin among rails. */
+	uint16_t next_rail_id = 0;
+
+	/* Pool of registered buffers for ACK send messages */
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> ack_send_fl;
 
 	/**
 	 * Queue of pending Libfabric requests to be retried
 	 */
 	std::deque<nccl_net_ofi_gin_op_req_t *> pending_requests;
 
+	/* Pre-allocated host buffer used as the local DMA target for iflush
+	   fi_read operations. One cache-line slot per rail. */
+	void *flush_buff = nullptr;
+	nccl_ofi_gin_mr_handle_t *flush_buff_mr_handle = nullptr;
+
+	/* GPU-resident flush buffer — source of the local fi_read. The NIC
+	   reads from this GPU buffer into flush_buff (host) via loopback,
+	   which forces the NIC to drain its PCIe write/read queue. */
+	void *flush_buff_gpu = nullptr;
+	nccl_ofi_gin_mr_handle_t *flush_buff_gpu_mr_handle = nullptr;
+
+	/* === Tier 3 — accessed only at connect/disconnect time === */
+	nccl_ofi_idpool_t comm_id_pool;
+
 	/* Number of associated comms */
 	size_t ref_cnt = 0;
 
-	/* For rail scheduling. Currently we do round-robin among rails. */
-	uint16_t next_rail_id = 0;
-
-	/* Requests pool used by all comms of this resource */
-	// FIXME: Get rid of freelist_deleter and change to embedded
-	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> req_fl;
+	/* === Self-contained lookup — 8KB array at end to avoid pushing
+	   other hot members apart === */
+	std::array<nccl_ofi_rdma_gin_put_comm *, NCCL_GIN_MAX_COMMS> gin_comms{};
 
 	/**
 	 * Retry requests that were pending due to EAGAIN or lack of space in
 	 * completion queue
 	 */
 	int retry_pending_reqs();
-
-	/* Pool of buffers for recv requests */
-	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> rx_buff_fl;
-
-	/* Pool of registered buffers for ACK send messages */
-	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> ack_send_fl;
-
-	/* Reqs for RX buffers */
-	std::vector<nccl_net_ofi_gin_recv_req_t> recv_reqs;
 
 	/* Post all recv buffers for a given rail */
 	void post_rx_buffs_on_rail(nccl_ofi_gin_ep_rail_t &rail, size_t num_buffers);

@@ -209,6 +209,7 @@ private:
 };
 
 class nccl_net_ofi_gin_write_req_t;
+class nccl_net_ofi_gin_read_req_t;
 class nccl_net_ofi_gin_metadata_send_req_t;
 
 /**
@@ -244,6 +245,63 @@ private:
 	uint16_t msg_seq_num;
 	/* True if sender is requesting an ACK (SIGNAL, PUT-SIGNAL, or every Nth PUT) */
 	bool is_ack_requested;
+};
+
+/**
+ * Umbrella request tracking completion of multiple read sub-requests.
+ * Used by iget operations.
+ */
+class nccl_ofi_gin_iget_req : public nccl_net_ofi_gin_base_req {
+public:
+	nccl_ofi_gin_iget_req(nccl_ofi_gin_resources &resources_arg)
+	    : any_reqs_pending(0), resources(resources_arg)
+	{
+	}
+
+	int test(int *done) override;
+
+	/* Each sub read request holds a pointer to one slot of reqs_pending and
+	   clears it on completion. Aliased with any_reqs_pending so test() can
+	   check all slots in a single load. */
+	union {
+		bool reqs_pending[MAX_NUM_RAILS];
+		uint64_t any_reqs_pending;
+	};
+	static_assert(sizeof(reqs_pending) <= sizeof(any_reqs_pending),
+		      "any_reqs_pending must cover all reqs_pending bytes");
+
+private:
+	nccl_ofi_gin_resources &resources;
+};
+
+#define NCCL_OFI_GIN_FLUSH_SENTINEL_VAL (0xdeadbeefdeadbeefULL)
+
+/**
+ * Flush request that uses sentinel-based polling to detect completion.
+ *
+ * Instead of waiting for CQ completions, test() polls the host flush buffer
+ * for the sentinel value. The fi_read copies the sentinel from the GPU buffer
+ * into the host buffer; once visible, all prior operations are fenced.
+ * Sub-requests still self-return to pool via their CQ completion handler.
+ *
+ * Only one iflush may be outstanding per resources instance at a time (the
+ * host flush buffer is shared). NCCL guarantees this by polling to completion.
+ */
+class nccl_ofi_gin_iflush_req : public nccl_net_ofi_gin_base_req {
+public:
+	nccl_ofi_gin_iflush_req(nccl_ofi_gin_resources &resources_arg,
+				void *host_buff_arg, uint16_t num_rails_arg)
+	    : resources(resources_arg), host_buff(host_buff_arg),
+	      num_rails(num_rails_arg)
+	{
+	}
+
+	int test(int *done) override;
+
+private:
+	nccl_ofi_gin_resources &resources;
+	void *host_buff;
+	uint16_t num_rails;
 };
 
 /**
@@ -334,6 +392,42 @@ public:
 };
 
 /**
+ * Request for an fi_read operation (used by iget). On CQ completion, clears
+ * its pending_flag back-pointer in the umbrella iget_req and returns itself
+ * to the request pool.
+ */
+class nccl_net_ofi_gin_read_req_t : public nccl_net_ofi_gin_op_req_t {
+public:
+	nccl_net_ofi_gin_read_req_t(nccl_ofi_gin_resources &resources_arg,
+				    struct fid_ep *ep_arg, void *local_buf_arg,
+				    size_t size_arg, void *desc_arg,
+				    fi_addr_t remote_addr_arg, uint64_t remote_offset_arg,
+				    uint64_t remote_key_arg)
+	    : resources(resources_arg), ep(ep_arg), local_buf(local_buf_arg),
+	      size(size_arg), desc(desc_arg), remote_addr(remote_addr_arg),
+	      remote_offset(remote_offset_arg), remote_key(remote_key_arg)
+	{
+	}
+
+	int post() override;
+
+	int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
+			    uint16_t rail_id) override;
+
+	bool *pending_flag = nullptr;
+
+private:
+	nccl_ofi_gin_resources &resources;
+	struct fid_ep *ep;
+	void *local_buf;
+	size_t size;
+	void *desc;
+	fi_addr_t remote_addr;
+	uint64_t remote_offset;
+	uint64_t remote_key;
+};
+
+/**
  * Request for the metadata send operation associated with a put-signal request
  */
 class nccl_net_ofi_gin_metadata_send_req_t : public nccl_net_ofi_gin_op_req_t {
@@ -383,7 +477,10 @@ private:
 	nccl_ofi_rdma_gin_iputsignal_req iputsignal_req;
 	nccl_net_ofi_gin_iputsignal_recv_req iputsignal_recv_req;
 	nccl_net_ofi_gin_write_req_t write_req;
+	nccl_net_ofi_gin_read_req_t read_req;
 	nccl_net_ofi_gin_metadata_send_req_t metadata_send_req;
+	nccl_ofi_gin_iget_req iget_req;
+	nccl_ofi_gin_iflush_req iflush_req;
 };
 
 #endif
