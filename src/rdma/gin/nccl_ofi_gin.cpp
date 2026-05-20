@@ -263,44 +263,35 @@ int nccl_ofi_rdma_gin_put_comm::send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, u
 	uint32_t peer_comm_id = rank_comm.comm_id;
 
 	auto &ep = gin_comm.resources.get_ep();
-	auto *ack_fl = gin_comm.resources.get_ack_send_fl();
-
-	auto *ack_elem = ack_fl->entry_alloc();
-	if (!ack_elem) {
-		NCCL_OFI_WARN("Failed to allocate ACK send buffer");
-		return -ENOMEM;
-	}
-
-	auto *ack_msg = static_cast<gin_ack_msg_t *>(ack_elem->ptr);
-	*ack_msg = {};
-	ack_msg->msg_type = GIN_MSG_TYPE_ACK;
-	ack_msg->ack_comm_id = static_cast<uint16_t>(peer_comm_id);
-	ack_msg->ack_seq_num = static_cast<uint16_t>(ack_seq_num);
-	ack_msg->ack_count = static_cast<uint16_t>(count);
-
 	auto *ofi_ep = ep.get_rail(rail_id).ofi_ep.get();
 
-	nccl_net_ofi_gin_sendack_req_t *req;
-	try {
-		req = gin_comm.resources.get_req_from_pool<nccl_net_ofi_gin_sendack_req_t>(
-			gin_comm, ofi_ep, rail_id, ack_elem,
-			rank_comm.address[rail_id], ack_fl);
-	} catch (...) {
-		ack_fl->entry_free(ack_elem);
-		throw;
-	}
+	/* The 8-byte ACK is small enough to inline. fi_inject is locally
+	   completed before returning so we don't need an ack freelist
+	   entry, an op_req pool slot, the outstanding_ack_counter that
+	   forces deliver_all to spin on resources.progress(), or the
+	   per-ACK CQ entry. */
+	gin_ack_msg_t ack_msg{};
+	ack_msg.msg_type = GIN_MSG_TYPE_ACK;
+	ack_msg.ack_comm_id = static_cast<uint16_t>(peer_comm_id);
+	ack_msg.ack_seq_num = static_cast<uint16_t>(ack_seq_num);
+	ack_msg.ack_count = static_cast<uint16_t>(count);
 
 	NCCL_OFI_TRACE_GIN_ACK_SEND(dev, rail_id, &gin_comm, peer_rank, ack_seq_num);
 
-	int ret = req->post();
-	if (ret == -FI_EAGAIN) {
-		gin_comm.resources.add_pending_req(req);
-		ret = 0;
-	} else if (ret != 0) {
-		gin_comm.resources.return_req_to_pool(req);
+	ssize_t ret;
+	while (true) {
+		ret = fi_inject(ofi_ep, &ack_msg, sizeof(ack_msg),
+				rank_comm.address[rail_id]);
+		if (OFI_LIKELY(ret == 0)) break;
+		if (ret == -FI_EAGAIN) {
+			(void)gin_comm.resources.progress();
+			continue;
+		}
+		NCCL_OFI_WARN("fi_inject ack failed RC %zd", ret);
+		break;
 	}
 
-	return ret;
+	return (int)ret;
 }
 
 int nccl_ofi_rdma_gin_put_comm::regMrSymDmaBuf(nccl_ofi_mr_ckey_ref ckey, void *data_ptr, size_t size,
@@ -607,70 +598,73 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		if (size == 0)
 			rail_id = resources.get_next_rail();
 
-		/* Post metadata send with signal information */
-		nccl_ofi_freelist::fl_entry *metadata_elem = nullptr;
+		/* The 32-byte metadata header is small enough to inline, so
+		   stack-allocate, fill, and post via fi_inject. fi_inject is
+		   locally-completed before returning (libfabric copies the
+		   buffer into the doorbell region), so we don't need a
+		   freelist entry, an op_req pool slot, or a CQ completion to
+		   retire it. This eliminates roughly two cache-line writes,
+		   one freelist alloc, and one CQ entry per put-signal under
+		   ep_lock — the heaviest small-message overhead in GIN. */
+		nccl_net_ofi_gin_signal_metadata_msg_t metadata_send{};
 
-		metadata_elem = metadata_fl.get()->entry_alloc();
-		if (!metadata_elem) {
-			NCCL_OFI_WARN("Failed to allocate metadata freelist entry");
-			clear_write_reqs_pending_back_pointers(write_reqs);
-			resources.return_req_to_pool(req);
-			return -ENOMEM;
-		}
-
-		auto *metadata_send =
-			static_cast<nccl_net_ofi_gin_signal_metadata_msg_t *>(metadata_elem->ptr);
-
-		metadata_send->header.msg_type = GIN_MSG_TYPE_METADATA;
-		metadata_send->header.remote_comm_id = remote_comm_id;
-		metadata_send->header.seq_num = msg_seq_num;
-		metadata_send->header.seq_seg_cnt = nseg;
-		metadata_send->signal_base_address =
+		metadata_send.header.msg_type = GIN_MSG_TYPE_METADATA;
+		metadata_send.header.remote_comm_id = remote_comm_id;
+		metadata_send.header.seq_num = msg_seq_num;
+		metadata_send.header.seq_seg_cnt = nseg;
+		metadata_send.signal_base_address =
 			(sig_mr ? sig_mr->remote_mr[dst_rank].address : 0);
-		metadata_send->signal_offset = signalOff;
+		metadata_send.signal_offset = signalOff;
 		if (signalOp == NCCL_NET_SIGNAL_OP_INC) {
-			metadata_send->signal_value = 1;
+			metadata_send.signal_value = 1;
 		} else if (signalOp == NCCL_NET_SIGNAL_OP_ADD) {
-			metadata_send->signal_value = signalValue;
+			metadata_send.signal_value = signalValue;
 		} else {
-			metadata_send->signal_value = 0;
+			metadata_send.signal_value = 0;
 		}
 
 		/* Bundle pending ack for this peer */
 		if (rank_comm.pending_ack.ack_count > 0) {
-			metadata_send->header.ack_seq_num = rank_comm.pending_ack.seq_num;
-			metadata_send->header.ack_count = rank_comm.pending_ack.ack_count;
+			metadata_send.header.ack_seq_num = rank_comm.pending_ack.seq_num;
+			metadata_send.header.ack_count = rank_comm.pending_ack.ack_count;
 			rank_comm.pending_ack.ack_count = 0;
 		} else {
-			metadata_send->header.ack_count = 0;
+			metadata_send.header.ack_count = 0;
 		}
 
-		/* This send flushes the QP work queue on the first rail,
+		/* This inject flushes the QP work queue on the first rail,
 		   issuing a doorbell that includes the coalesced writedata
-		   WQE posted with FI_MORE above. */
-		nccl_net_ofi_gin_metadata_send_req_t *send_req;
-		send_req = resources.get_req_from_pool<nccl_net_ofi_gin_metadata_send_req_t>(
-			gin_ep.get_rail(rail_id).ofi_ep.get(), rail_id, metadata_elem,
-			rank_comm.address[rail_id], metadata_fl.get(), this);
+		   WQE posted with FI_MORE above.
 
-		NCCL_OFI_TRACE_GIN_METADATA_SEND_BEGIN(dev, rail_id, this, dst_rank, msg_seq_num,
-						       send_req);
-		ret = send_req->post();
-		if (ret == -FI_EAGAIN) {
-			resources.add_pending_req(send_req);
-			ret = 0;
-		} else if (OFI_UNLIKELY(ret != 0)) {
-			NCCL_OFI_WARN("Metadata send failed for seq_num %hu", msg_seq_num);
-			resources.return_req_to_pool(send_req);
+		   FI_EAGAIN means the TX queue is momentarily full; spin
+		   while progressing the CQ. The metadata send is tiny and
+		   the proxy already polls progress on the same thread, so
+		   we drain a few completions and retry rather than queueing
+		   into pending_reqs (which would force allocating a heap
+		   buffer to back the inject after our stack frame unwinds). */
+		auto *ofi_ep = gin_ep.get_rail(rail_id).ofi_ep.get();
+		fi_addr_t inject_addr = rank_comm.address[rail_id];
+		ssize_t rc;
+		while (true) {
+			rc = fi_inject(ofi_ep, &metadata_send,
+				       sizeof(metadata_send), inject_addr);
+			if (OFI_LIKELY(rc == 0)) {
+				break;
+			}
+			if (rc == -FI_EAGAIN) {
+				(void)resources.progress();
+				continue;
+			}
+			NCCL_OFI_WARN("fi_inject metadata failed for seq_num %hu rc %zd",
+				      msg_seq_num, rc);
 			resources.return_req_to_pool(req);
 			clear_write_reqs_pending_back_pointers(write_reqs);
-			return ret;
+			return (int)rc;
 		}
-		send_req->pending_flag = &(req->reqs_pending[MAX_NUM_RAILS]); // last one
-#if HAVE_NVTX_TRACING || HAVE_LIBLTTNG_UST
-		send_req->set_info(dev, dst_rank, msg_seq_num);
-#endif
-		req->reqs_pending[MAX_NUM_RAILS] = true;
+		NCCL_OFI_TRACE_GIN_METADATA_SEND_BEGIN(dev, rail_id, this, dst_rank,
+						       msg_seq_num, nullptr);
+		NCCL_OFI_TRACE_GIN_METADATA_SEND_END(dev, rail_id, this, dst_rank,
+						     msg_seq_num, nullptr);
 	}
 
 	rank_comm.active_put_signal.set(msg_seq_num & GIN_IMM_SEQ_MASK, is_ack_requested);
