@@ -32,6 +32,8 @@ xj_recv_set(nccl_ofi_gin_peer_rank_info &p, uint16_t seq,
 #include "nccl_ofi_rdma.h"
 #include "nccl_ofi_tracepoint.h"
 
+#include <vector>
+
 struct gin_connect_handle {
 	/* Number of rails */
 	uint16_t num_rails;
@@ -85,10 +87,35 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &r
 
 	resources.set_comm(local_comm_id, *this);
 	resources.increment_ref_cnt();
+
+	/* Spawn the gdrcopy worker thread. Failure here is recoverable: we
+	 * fall back to running gdrcopy on the proxy thread in
+	 * do_gin_signal_and_trace by leaving gdrcopy_thread_started = 0. */
+	int pt_rc = pthread_create(&gdrcopy_thread, nullptr,
+				   nccl_ofi_rdma_gin_put_comm::gdrcopy_thread_entry,
+				   this);
+	if (pt_rc == 0) {
+		gdrcopy_thread_started.store(1, std::memory_order_release);
+	} else {
+		NCCL_OFI_WARN("Failed to spawn GIN gdrcopy worker thread: %d, "
+		              "falling back to running gdrcopy on proxy thread",
+			      pt_rc);
+	}
 }
 
 nccl_ofi_rdma_gin_put_comm::~nccl_ofi_rdma_gin_put_comm()
 {
+	/* Stop and join the gdrcopy worker thread. The worker is busy-polling,
+	 * so it will see gdrcopy_thread_stop on its next loop iteration. */
+	if (gdrcopy_thread_started.load(std::memory_order_acquire)) {
+		gdrcopy_thread_stop.store(1, std::memory_order_release);
+		while (pthread_tryjoin_np(gdrcopy_thread, nullptr) == EBUSY) {
+			drain_gdrcopy_done_queue();
+		}
+	}
+	/* Drain any leftover done-queue entries (best effort). */
+	drain_gdrcopy_done_queue();
+
 #if HAVE_NVTX_TRACING
 	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
 		for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
@@ -753,6 +780,15 @@ int nccl_ofi_rdma_gin_put_comm::do_gin_signal_and_trace(uint32_t peer_rank,
 {
 	NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_BEGIN(dev, this, peer_rank,
 						 req->metadata.header.seq_num, req);
+
+	/* Hand the gdrcopy work off to the worker thread when running. The
+	 * proxy reaps via drain_gdrcopy_done_queue() each progress tick.
+	 * Falls back to running gdrcopy on the proxy thread if the worker
+	 * never started. */
+	if (gdrcopy_thread_started.load(std::memory_order_acquire)) {
+		return enqueue_gdrcopy_work(peer_rank, req);
+	}
+
 	int ret = do_gin_signal(req->metadata);
 	NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, peer_rank,
 					       req->metadata.header.seq_num, req);
@@ -761,6 +797,87 @@ int nccl_ofi_rdma_gin_put_comm::do_gin_signal_and_trace(uint32_t peer_rank,
 			      (unsigned long)req->metadata.header.seq_num);
 	}
 	return ret;
+}
+
+/* Push a signal-delivery work item to the gdrcopy worker. The proxy must
+ * not run gdrcopy on the proxy thread if the ring is full: the worker is
+ * also walking the same signal slot, and two concurrent r-m-w sequences
+ * against a PCIe-mapped counter can race and lose increments. Spin
+ * instead, waking the worker each iteration and draining its done ring
+ * while we wait. The work ring is 1024 deep, so under normal load this
+ * loop never iterates; if it does, it means a recv burst genuinely
+ * outpaced gdrcopy and we want to throttle the proxy until the worker
+ * catches up. */
+int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
+						nccl_net_ofi_gin_iputsignal_recv_req *req)
+{
+	gin_signal_work_entry w;
+	w.metadata = req->metadata;
+	w.req = req;
+	w.peer_rank = peer_rank;
+
+	while (!gdrcopy_work_queue.push(w)) {
+		drain_gdrcopy_done_queue();
+		asm volatile("" ::: "memory");
+	}
+	return 0;
+}
+
+/* Drain the worker's done queue. Each entry is a signal whose gdrcopy
+ * has already been applied. The proxy logs failures here; libfabric-
+ * side ack and retire bookkeeping is handled by the regular
+ * iput_signal_recv_req_completion path on a later tick. */
+int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
+{
+	gin_signal_done_entry d;
+	int ret = 0;
+	while (gdrcopy_done_queue.pop(d)) {
+		NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, d.peer_rank,
+						       d.seq_num, d.req);
+		if (OFI_UNLIKELY(d.status != 0)) {
+			NCCL_OFI_WARN("gdrcopy worker failed for signal seq_num %hu (rc=%d)",
+				      d.seq_num, d.status);
+			ret = d.status;
+		}
+	}
+	return ret;
+}
+
+/* pthread_create entry point. Runs run_gdrcopy_worker_loop on the
+ * given comm. */
+void *nccl_ofi_rdma_gin_put_comm::gdrcopy_thread_entry(void *arg)
+{
+	auto *self = static_cast<nccl_ofi_rdma_gin_put_comm *>(arg);
+	self->run_gdrcopy_worker_loop();
+	return nullptr;
+}
+
+void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
+{
+	gin_signal_work_entry w;
+	while (!gdrcopy_thread_stop.load(std::memory_order_acquire)) {
+		if (!gdrcopy_work_queue.pop(w)) {
+			/* Empty queue: busy-poll. Hot signal-delivery path
+			 * cannot afford the futex syscall round-trip. The
+			 * worker pegs one core. */
+			asm volatile("" ::: "memory");
+			continue;
+		}
+
+		int status = do_gin_signal(w.metadata);
+
+		gin_signal_done_entry d;
+		d.req = w.req;
+		d.peer_rank = w.peer_rank;
+		d.seq_num = w.metadata.header.seq_num;
+		d.status = status;
+		while (!gdrcopy_done_queue.push(d)) {
+			/* Done queue full: brief pause, proxy will drain on its
+			 * next tick. Both queues are sized 1024 so this is
+			 * unlikely under normal operation. */
+			asm volatile("" ::: "memory");
+		}
+	}
 }
 
 int nccl_ofi_rdma_gin_put_comm::iput_signal_recv_req_completion(uint32_t peer_rank, uint64_t map_key,
@@ -831,9 +948,15 @@ int nccl_ofi_rdma_gin_put_comm::stash_pending_ack(uint32_t peer_rank, uint16_t s
 }
 
 /* Flush pending bundled acks that have aged past the threshold
-   for peers with no recent completions. Called from progress. */
+   for peers with no recent completions. Called from progress. Also
+   drains the gdrcopy worker's done queue, so signal-delivery
+   completions are reaped every progress tick. */
 int nccl_ofi_rdma_gin_put_comm::flush_stale_acks()
 {
+	if (gdrcopy_thread_started.load(std::memory_order_acquire)) {
+		(void)drain_gdrcopy_done_queue();
+	}
+
 	++progress_counter;
 	nccl_ofi_dlist_node *pos;
 	nccl_ofi_dlist_for_each_safe(&pending_ack_list, pos) {
