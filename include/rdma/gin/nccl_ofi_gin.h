@@ -15,6 +15,8 @@
 #include "nccl_ofi_tracepoint.h"
 
 #include <bitset>
+#include <atomic>
+#include <pthread.h>
 
 /**
  * Get singleton instance of the device copy context shared across all GIN communicators.
@@ -176,6 +178,64 @@ struct nccl_ofi_rdma_gin_symm_mr_handle : public nccl_ofi_gin_symm_mr_handle_t {
 /**
  * This represents the main GIN communicator
  */
+/**
+ * Single-producer / single-consumer lock-free ring used to hand
+ * GIN signal-delivery work between the proxy CQ-drain thread (producer)
+ * and a dedicated gdrcopy worker thread (consumer). FIFO ordering is
+ * guaranteed by the SPSC contract, which preserves seq-num delivery
+ * order under strong_signal_ordering. CAPACITY must be a power of two.
+ */
+template <typename T, int CAPACITY = 1024>
+class nccl_ofi_gin_spsc_ring {
+	T ring[CAPACITY];
+	alignas(64) std::atomic<int> head{0};
+	alignas(64) std::atomic<int> tail{0};
+public:
+	bool push(const T &entry) {
+		int h = head.load(std::memory_order_relaxed);
+		int next = (h + 1) % CAPACITY;
+		if (next == tail.load(std::memory_order_acquire)) {
+			return false;
+		}
+		ring[h] = entry;
+		head.store(next, std::memory_order_release);
+		return true;
+	}
+	bool pop(T &entry) {
+		int t = tail.load(std::memory_order_relaxed);
+		if (t == head.load(std::memory_order_acquire)) {
+			return false;
+		}
+		entry = ring[t];
+		tail.store((t + 1) % CAPACITY, std::memory_order_release);
+		return true;
+	}
+};
+
+/**
+ * Work descriptor enqueued by the proxy CQ-drain thread for the gdrcopy
+ * worker. The signal metadata is captured by value so the recv buffer
+ * can be re-armed without waiting for the worker to consume.
+ */
+struct gin_signal_work_entry {
+	nccl_net_ofi_gin_signal_metadata_msg_t metadata;
+	nccl_net_ofi_gin_iputsignal_recv_req *req;
+	uint32_t peer_rank;
+};
+
+/**
+ * Done descriptor pushed by the worker thread back to the proxy. The
+ * worker only does the gdrcopy read-modify-write; libfabric-side
+ * bookkeeping (retire_completed_peer_iput_ops, send_ack) stays on
+ * the proxy because libfabric EP affinity requires it.
+ */
+struct gin_signal_done_entry {
+	nccl_net_ofi_gin_iputsignal_recv_req *req;
+	uint32_t peer_rank;
+	uint16_t seq_num;
+	int status;
+};
+
 class nccl_ofi_rdma_gin_put_comm : public nccl_ofi_gin_put_comm_t {
 public:
 	nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &resources_arg, int rank_, int nranks_,
@@ -461,6 +521,24 @@ private:
 	int stash_pending_ack(uint32_t peer_rank, uint16_t seq_num);
 
 	int retire_completed_peer_iput_ops(uint32_t peer_rank);
+
+	/* --- gdrcopy worker thread (signal delivery off proxy) ---
+	 * The proxy CQ-drain thread pushes completed signal recv reqs into
+	 * gdrcopy_work_queue; the worker pops, runs do_gin_signal (the gdrcopy
+	 * read-modify-write to/from device memory), and pushes results to
+	 * gdrcopy_done_queue. The proxy drains the done queue every progress
+	 * tick. */
+	pthread_t gdrcopy_thread;
+	std::atomic<int> gdrcopy_thread_stop{0};
+	std::atomic<int> gdrcopy_thread_started{0};
+	nccl_ofi_gin_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;
+	nccl_ofi_gin_spsc_ring<gin_signal_done_entry> gdrcopy_done_queue;
+
+	static void *gdrcopy_thread_entry(void *arg);
+	void run_gdrcopy_worker_loop();
+	int enqueue_gdrcopy_work(uint32_t peer_rank,
+				 nccl_net_ofi_gin_iputsignal_recv_req *req);
+	int drain_gdrcopy_done_queue();
 
 	friend class nccl_ofi_rdma_gin_listen_comm;
 
