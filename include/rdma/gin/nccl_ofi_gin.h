@@ -227,10 +227,13 @@ struct gin_signal_work_entry {
 };
 
 /**
- * Done descriptor pushed by the worker thread back to the proxy. The
- * worker only does the gdrcopy read-modify-write; libfabric-side
- * bookkeeping (xj_recv erase, retire_completed, send_ack) stays on
- * the proxy because libfabric EP affinity requires it.
+ * Done descriptor pushed by the worker thread back to the proxy.  The
+ * worker only does the gdrcopy read-modify-write; the proxy stashes
+ * the bundled ack, erases the map entry, and returns the req to the
+ * pool when it sees the matching done entry.  Deferring those steps
+ * past the gdrcopy is what closes the signal-counter corruption race
+ * (sender saw ack, reused seq slot, delayed worker atomic-added into
+ * the next round's counter).
  */
 struct gin_signal_done_entry {
 	nccl_net_ofi_gin_iputsignal_recv_req *req;

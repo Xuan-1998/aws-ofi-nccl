@@ -929,12 +929,16 @@ void nccl_ofi_rdma_gin_put_comm::wake_gdrcopy_worker()
 	}
 }
 
-/* Push a signal-delivery work item to the gdrcopy worker. Returns 0 on
- * success. If the work ring is full, drains the done ring once to free
- * space (and wakes the worker first, mirroring the missed-wake fix in
- * https://github.com/amazon-contributing/upstream-to-nvshmem/pull/16),
- * then retries. If still full, falls back to inline gdrcopy so the
- * proxy never spins. */
+/* Push a signal-delivery work item to the gdrcopy worker.  Blocks
+ * (drain-done + wake-worker + yield) until push() succeeds.  An inline
+ * gdrcopy fallback would deliver this seq before earlier ones still
+ * queued in the worker, breaking strong-ordering and corrupting the
+ * receiver's signal counter on the next round.  The watermark is
+ * implicit: the SPSC ring caps in-flight work at CAPACITY and the
+ * proxy back-pressures the producer rather than ever skipping the
+ * worker.  Mirrors the producer-side throttle pattern used in
+ * https://github.com/amazon-contributing/upstream-to-nvshmem/pull/18.
+ */
 int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
 						nccl_net_ofi_gin_iputsignal_recv_req *req)
 {
@@ -943,24 +947,33 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
 	w.req = req;
 	w.peer_rank = peer_rank;
 
-	if (!gdrcopy_work_queue.push(w)) {
+	unsigned spin = 0;
+	while (!gdrcopy_work_queue.push(w)) {
 		wake_gdrcopy_worker();
 		drain_gdrcopy_done_queue();
-		if (!gdrcopy_work_queue.push(w)) {
-			int ret = do_gin_signal(req->metadata);
-			NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, peer_rank,
-							       req->metadata.header.seq_num, req);
-			return ret;
+		if (gdrcopy_work_queue.push(w)) {
+			break;
+		}
+		if ((++spin & 0xff) == 0) {
+			sched_yield();
 		}
 	}
 	wake_gdrcopy_worker();
 	return 0;
 }
 
-/* Drain the worker's done queue. Each entry is a signal whose gdrcopy
- * has already been applied. The proxy logs failures here; libfabric-
- * side ack and retire bookkeeping is handled by the regular
- * iput_signal_recv_req_completion path on a later tick. */
+/* Drain the worker's done queue.  Each entry is a signal whose gdrcopy
+ * has already been applied.  Under strong ordering this is the only
+ * place safe to ack the sender, erase the map entry, and return the
+ * req to the pool: stashing the ack in retire would let the sender
+ * reuse the seq slot before the worker has actually applied the
+ * gdrcopy, and a delayed worker would then atomic_add into the next
+ * round's signal counter and trip DeepEP's expert-index assertion.
+ * The SPSC ring is FIFO and the strong-ordering retire path enqueues
+ * in seq-num order, so pops arrive monotonic per peer, satisfying
+ * stash_pending_ack().  Weak ordering keeps the original retire-time
+ * bookkeeping because that path already accepts out-of-order delivery
+ * by design. */
 int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 {
 	gin_signal_done_entry d;
@@ -972,7 +985,22 @@ int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 			NCCL_OFI_WARN("gdrcopy worker failed for signal seq_num %hu (rc=%d)",
 				      d.seq_num, d.status);
 			ret = d.status;
+			continue;
 		}
+		if (!strong_signal_ordering_enabled) {
+			continue;
+		}
+		if (d.req->is_ack_requested) {
+			int rc = stash_pending_ack(d.peer_rank, d.seq_num);
+			if (OFI_UNLIKELY(rc != 0)) {
+				ret = rc;
+				continue;
+			}
+		}
+		uint64_t map_key = get_req_map_key(d.peer_rank, d.seq_num);
+		size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(map_key);
+		assert_always(n_removed == 1);
+		this->resources.return_req_to_pool(d.req);
 	}
 	return ret;
 }
@@ -1029,6 +1057,11 @@ int nccl_ofi_rdma_gin_put_comm::iput_signal_recv_req_completion(uint32_t peer_ra
 	NCCL_OFI_TRACE(NCCL_NET, "Completed iputSignal seq num %hu on target",
 		       req->metadata.header.seq_num);
 
+	const bool deliver_via_worker =
+		req->metadata_received &&
+		strong_signal_ordering_enabled &&
+		gdrcopy_thread_started.load(std::memory_order_acquire);
+
 	if (req->metadata_received && strong_signal_ordering_enabled) {
 		ret = do_gin_signal_and_trace(peer_rank, req);
 		if (ret != 0) {
@@ -1036,9 +1069,16 @@ int nccl_ofi_rdma_gin_put_comm::iput_signal_recv_req_completion(uint32_t peer_ra
 		}
 	}
 
-	/* Remove this request entry from the map */
-	size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(map_key);
-	assert_always(n_removed == 1);
+	/* Erase migrates to drain_gdrcopy_done_queue only when work was
+	 * actually enqueued to the worker, so the sender can't observe the
+	 * ack and reuse the seq slot before the worker has applied the
+	 * gdrcopy.  PUT-only completions never reach the worker, so we
+	 * still erase here.  Weak ordering also erases here because it
+	 * runs the gdrcopy synchronously upstream. */
+	if (!deliver_via_worker) {
+		size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(map_key);
+		assert_always(n_removed == 1);
+	}
 
 	return ret;
 }
@@ -1117,10 +1157,26 @@ int nccl_ofi_rdma_gin_put_comm::flush_stale_acks()
 int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_rank)
 {
 	int ret = 0;
+	const bool worker_running =
+		strong_signal_ordering_enabled &&
+		gdrcopy_thread_started.load(std::memory_order_acquire);
 
-	/* Process undelivered signals in order.  ACK coalescing is
-	   handled entirely by stash_pending_ack(), which merges
-	   ranges and flushes when they exceed GIN_ACK_INTERVAL. */
+	/* Process undelivered signals in order.  ACK coalescing is handled
+	   entirely by stash_pending_ack(), which merges ranges and flushes
+	   when they exceed GIN_ACK_INTERVAL.
+
+	   When the worker is running and the req carries signal metadata,
+	   iput_signal_recv_req_completion enqueues the gdrcopy to the worker,
+	   and ack / erase / return_req_to_pool migrate to
+	   drain_gdrcopy_done_queue once the worker reports the done entry.
+	   Otherwise (PUT-only retires, weak mode, or worker-disabled builds)
+	   the gdrcopy was already applied synchronously and we keep the
+	   original retire-time bookkeeping.
+
+	   Issuing the ack here for a worker-deferred signal would let the
+	   sender reuse the seq slot before the worker has applied the
+	   gdrcopy and corrupt the next round's signal counter — the bug
+	   the watermark / back-pressure fix exists to close. */
 	while (true) {
 		auto &rank_comm = this->rank_comms[peer_rank];
 		uint16_t next_seq_num = rank_comm.next_delivered_signal_seq_num;
@@ -1131,7 +1187,10 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 			auto *req = it->second;
 
 			if (req->num_seg_completions == req->total_segments) {
-				if (req->is_ack_requested) {
+				const bool deferred_to_worker =
+					worker_running && req->metadata_received;
+
+				if (!deferred_to_worker && req->is_ack_requested) {
 					ret = stash_pending_ack(peer_rank, next_seq_num);
 					if (OFI_UNLIKELY(ret != 0)) {
 						return ret;
@@ -1145,7 +1204,9 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 					return ret;
 				}
 
-				this->resources.return_req_to_pool(req);
+				if (!deferred_to_worker) {
+					this->resources.return_req_to_pool(req);
+				}
 			} else {
 				/* No more signals to deliver */
 				break;
