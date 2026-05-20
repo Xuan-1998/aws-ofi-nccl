@@ -84,6 +84,8 @@ struct nccl_ofi_gin_pending_ack_info {
  * The collective communicator stores a vector of these structures, of size
  * nranks.
  */
+class nccl_net_ofi_gin_iputsignal_recv_req;
+
 struct nccl_ofi_gin_peer_rank_info {
 	/* Remote comm id */
 	uint32_t comm_id;
@@ -123,6 +125,12 @@ struct nccl_ofi_gin_peer_rank_info {
 	std::bitset<GIN_IMM_SEQ_MASK + 1> active_put_signal;
 	static_assert(GIN_IMM_SEQ_MASK + 1 <= UINT16_MAX,
 		      "active_put_signal must fit within the 16-bit seq_num range");
+
+	/* Flat array of outstanding recv requests indexed by (seq & mask).
+	 * Replaces the hashmap lookup with a direct array access on every
+	 * incoming write CQE. Single-thread (proxy) so no synchronization
+	 * needed. */
+	std::vector<nccl_net_ofi_gin_iputsignal_recv_req *> outstanding_recv_reqs;
 };
 
 /**

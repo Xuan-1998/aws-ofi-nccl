@@ -6,6 +6,26 @@
 
 #include "rdma/gin/nccl_ofi_gin.h"
 
+/* xuanj: O(1) flat-array access for outstanding recv reqs.
+ * Replaces unordered_map lookups by indexing into a per-peer flat array
+ * sized to GIN_IMM_SEQ_MASK+1. Single-thread proxy = no synchronization. */
+static inline nccl_net_ofi_gin_iputsignal_recv_req *
+xj_recv_get(nccl_ofi_gin_peer_rank_info &p, uint16_t seq) {
+	uint16_t idx = seq & GIN_IMM_SEQ_MASK;
+	if (idx < p.outstanding_recv_reqs.size())
+		return p.outstanding_recv_reqs[idx];
+	return nullptr;
+}
+static inline void
+xj_recv_set(nccl_ofi_gin_peer_rank_info &p, uint16_t seq,
+            nccl_net_ofi_gin_iputsignal_recv_req *req) {
+	uint16_t idx = seq & GIN_IMM_SEQ_MASK;
+	if (idx >= p.outstanding_recv_reqs.size())
+		p.outstanding_recv_reqs.resize(GIN_IMM_SEQ_MASK + 1, nullptr);
+	p.outstanding_recv_reqs[idx] = req;
+}
+
+
 #include "nccl_ofi_assert.h"
 #include "nccl_ofi_gdrcopy.h"
 #include "nccl_ofi_param.h"
@@ -627,6 +647,14 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 
 		NCCL_OFI_TRACE_GIN_METADATA_SEND_BEGIN(dev, rail_id, this, dst_rank, msg_seq_num,
 						       send_req);
+		/* Set pending_flag/info BEFORE post() because the inject path may
+		   synchronously complete (clearing the flag) and return the req to
+		   the pool, after which dereferencing send_req would be UAF. */
+		req->reqs_pending[MAX_NUM_RAILS] = true;
+		send_req->pending_flag = &(req->reqs_pending[MAX_NUM_RAILS]); // last one
+#if HAVE_NVTX_TRACING || HAVE_LIBLTTNG_UST
+		send_req->set_info(dev, dst_rank, msg_seq_num);
+#endif
 		ret = send_req->post();
 		if (ret == -FI_EAGAIN) {
 			resources.add_pending_req(send_req);
@@ -638,11 +666,6 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			clear_write_reqs_pending_back_pointers(write_reqs);
 			return ret;
 		}
-		send_req->pending_flag = &(req->reqs_pending[MAX_NUM_RAILS]); // last one
-#if HAVE_NVTX_TRACING || HAVE_LIBLTTNG_UST
-		send_req->set_info(dev, dst_rank, msg_seq_num);
-#endif
-		req->reqs_pending[MAX_NUM_RAILS] = true;
 	}
 
 	rank_comm.active_put_signal.set(msg_seq_num & GIN_IMM_SEQ_MASK, is_ack_requested);
@@ -755,8 +778,11 @@ int nccl_ofi_rdma_gin_put_comm::iput_signal_recv_req_completion(uint32_t peer_ra
 		}
 	}
 
-	/* Remove this request entry from the map */
-	size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(map_key);
+	/* Remove this request entry from the array. map_key encodes
+	 * (peer_rank << 16) | seq_num; we extract seq_num from req metadata. */
+	uint16_t seq = req->metadata.header.seq_num;
+	size_t n_removed = (xj_recv_get(rank_comms[peer_rank], seq) != nullptr) ? 1 : 0;
+	xj_recv_set(rank_comms[peer_rank], seq, nullptr);
 	assert_always(n_removed == 1);
 
 	return ret;
@@ -839,9 +865,9 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 		uint16_t next_seq_num = rank_comm.next_delivered_signal_seq_num;
 
 		uint64_t map_key = get_req_map_key(peer_rank, next_seq_num);
-		auto it = this->outstanding_iput_signal_recv_reqs.find(map_key);
-		if (it != this->outstanding_iput_signal_recv_reqs.end()) {
-			auto *req = it->second;
+		nccl_net_ofi_gin_iputsignal_recv_req *xj_req = xj_recv_get(rank_comms[peer_rank], next_seq_num);
+		if (xj_req != nullptr) {
+			auto *req = xj_req;
 
 			if (req->num_seg_completions == req->total_segments) {
 				if (req->is_ack_requested) {
@@ -892,9 +918,8 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 
 	uint64_t map_key = get_req_map_key(peer_rank, msg_seq_num);
 
-	auto it = outstanding_iput_signal_recv_reqs.find(map_key);
-	nccl_net_ofi_gin_iputsignal_recv_req *req;
-	if (it == outstanding_iput_signal_recv_reqs.end()) {
+	nccl_net_ofi_gin_iputsignal_recv_req *req = xj_recv_get(rank_comms[peer_rank], msg_seq_num);
+	if (req == nullptr) {
 		req = resources.get_req_from_pool<nccl_net_ofi_gin_iputsignal_recv_req>();
 
 		req->num_seg_completions = 1;
@@ -902,9 +927,8 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 		req->metadata = *metadata_msg;
 		req->metadata_received = true;
 		req->is_ack_requested = true;  // Metadata always requests ACK
-		outstanding_iput_signal_recv_reqs[map_key] = req;
+		xj_recv_set(rank_comms[peer_rank], msg_seq_num, req);
 	} else {
-		req = it->second;
 
 		req->metadata = *metadata_msg;
 		req->metadata_received = true;
@@ -960,17 +984,15 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data
 
 	int ret = 0;
 
-	auto it = outstanding_iput_signal_recv_reqs.find(map_key);
-	nccl_net_ofi_gin_iputsignal_recv_req *req;
-	if (it == outstanding_iput_signal_recv_reqs.end()) {
+	nccl_net_ofi_gin_iputsignal_recv_req *req = xj_recv_get(rank_comms[peer_rank], msg_seq_num);
+	if (req == nullptr) {
 		req = resources.get_req_from_pool<nccl_net_ofi_gin_iputsignal_recv_req>();
 
 		req->num_seg_completions = 1;
 		req->total_segments = total_segms;
 		req->is_ack_requested = is_ack_requested;
-		outstanding_iput_signal_recv_reqs[map_key] = req;
+		xj_recv_set(rank_comms[peer_rank], msg_seq_num, req);
 	} else {
-		req = it->second;
 		assert(req->total_segments == total_segms);
 		req->num_seg_completions += 1;
 	}
