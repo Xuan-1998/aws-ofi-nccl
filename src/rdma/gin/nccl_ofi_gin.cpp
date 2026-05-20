@@ -966,6 +966,34 @@ void *nccl_ofi_rdma_gin_put_comm::gdrcopy_thread_entry(void *arg)
 
 void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 {
+	/* Coalesce buffer: collected work entries that target the same
+	 * (signal_base_address, signal_offset) slot are folded into a single
+	 * gdrcopy +N call. The reporting descriptors still flow back to the
+	 * proxy individually so libfabric retire/ACK bookkeeping is unchanged. */
+	std::vector<gin_signal_work_entry> run;
+	run.reserve(64);
+
+	auto apply_run = [&]() {
+		if (run.empty()) return;
+		uint64_t merged = 0;
+		for (auto &e : run) merged += e.metadata.signal_value;
+		nccl_net_ofi_gin_signal_metadata_msg_t md = run.front().metadata;
+		md.signal_value = merged;
+
+		int status = do_gin_signal(md);
+		for (auto &e : run) {
+			gin_signal_done_entry d{};
+			d.req = e.req;
+			d.peer_rank = e.peer_rank;
+			d.seq_num = e.metadata.header.seq_num;
+			d.status = status;
+			while (!gdrcopy_done_queue.push(d)) {
+				asm volatile("" ::: "memory");
+			}
+		}
+		run.clear();
+	};
+
 	gin_signal_work_entry w;
 	while (!gdrcopy_thread_stop.load(std::memory_order_acquire)) {
 		if (!gdrcopy_work_queue.pop(w)) {
@@ -976,19 +1004,34 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 			continue;
 		}
 
-		int status = do_gin_signal(w.metadata);
-
-		gin_signal_done_entry d;
-		d.req = w.req;
-		d.peer_rank = w.peer_rank;
-		d.seq_num = w.metadata.header.seq_num;
-		d.status = status;
-		while (!gdrcopy_done_queue.push(d)) {
-			/* Done queue full: brief pause, proxy will drain on its
-			 * next tick. Both queues are sized 1024 so this is
-			 * unlikely under normal operation. */
-			asm volatile("" ::: "memory");
+		/* Continue the open run when the next item targets the same
+		 * signal slot, otherwise close out the current run and open
+		 * a new one. */
+		if (!run.empty() &&
+		    (w.metadata.signal_base_address !=
+			run.front().metadata.signal_base_address ||
+		     w.metadata.signal_offset !=
+			run.front().metadata.signal_offset)) {
+			apply_run();
 		}
+		run.push_back(w);
+
+		/* Greedily drain more same-slot entries that are already
+		 * sitting in the queue before issuing the gdrcopy. This is
+		 * the source of the 1->N signal compaction. */
+		while (gdrcopy_work_queue.pop(w)) {
+			if (w.metadata.signal_base_address ==
+				run.front().metadata.signal_base_address &&
+			    w.metadata.signal_offset ==
+				run.front().metadata.signal_offset) {
+				run.push_back(w);
+			} else {
+				apply_run();
+				run.push_back(w);
+			}
+		}
+
+		apply_run();
 	}
 }
 
