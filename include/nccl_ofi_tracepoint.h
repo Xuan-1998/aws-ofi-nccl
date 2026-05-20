@@ -174,6 +174,14 @@
 	NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END_NVTX(request); \
 } while(0)
 
+#define NCCL_OFI_TRACE_GIN_GDRCOPY_BEGIN(dev, comm, rank, msg_seq_num, request) do { \
+	lttng_ust_tracepoint(nccl_ofi_plugin, gin_gdrcopy_begin, dev, comm, rank, msg_seq_num, request); \
+} while(0)
+
+#define NCCL_OFI_TRACE_GIN_GDRCOPY_END(dev, comm, rank, msg_seq_num, request) do { \
+	lttng_ust_tracepoint(nccl_ofi_plugin, gin_gdrcopy_end, dev, comm, rank, msg_seq_num, request); \
+} while(0)
+
 #define NCCL_OFI_TRACE_GIN_ACK_RECV(dev, rail_id, comm, rank, msg_seq_num) do { \
 	lttng_ust_tracepoint(nccl_ofi_plugin, gin_ack_recv, dev, rail_id, comm, rank, msg_seq_num); \
 	NCCL_OFI_TRACE_GIN_ACK_RECV_NVTX(comm, rail_id, rank, msg_seq_num); \

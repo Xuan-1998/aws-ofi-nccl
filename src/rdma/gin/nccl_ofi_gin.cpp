@@ -901,7 +901,11 @@ int nccl_ofi_rdma_gin_put_comm::do_gin_signal_and_trace(uint32_t peer_rank,
 		return enqueue_gdrcopy_work(peer_rank, req);
 	}
 
+	NCCL_OFI_TRACE_GIN_GDRCOPY_BEGIN(dev, this, peer_rank,
+					 req->metadata.header.seq_num, req);
 	int ret = do_gin_signal(req->metadata);
+	NCCL_OFI_TRACE_GIN_GDRCOPY_END(dev, this, peer_rank,
+				       req->metadata.header.seq_num, req);
 	NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, peer_rank,
 					       req->metadata.header.seq_num, req);
 	if (OFI_UNLIKELY(ret != 0)) {
@@ -980,7 +984,11 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 		nccl_net_ofi_gin_signal_metadata_msg_t md = run.front().metadata;
 		md.signal_value = merged;
 
+		NCCL_OFI_TRACE_GIN_GDRCOPY_BEGIN(dev, this, run.front().peer_rank,
+						 md.header.seq_num, run.front().req);
 		int status = do_gin_signal(md);
+		NCCL_OFI_TRACE_GIN_GDRCOPY_END(dev, this, run.front().peer_rank,
+					       md.header.seq_num, run.front().req);
 		for (auto &e : run) {
 			gin_signal_done_entry d{};
 			d.req = e.req;
