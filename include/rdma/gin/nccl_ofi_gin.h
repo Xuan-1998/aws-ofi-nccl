@@ -219,24 +219,32 @@ public:
  * Work descriptor enqueued by the proxy CQ-drain thread for the gdrcopy
  * worker. The signal metadata is captured by value so the recv buffer
  * can be re-armed without waiting for the worker to consume.
+ *
+ * is_ack_requested travels with the entry because ACK release must be
+ * deferred until after do_gin_signal has actually been issued by the
+ * worker; the proxy stashes the ACK only when the matching done entry
+ * is drained.
  */
 struct gin_signal_work_entry {
 	nccl_net_ofi_gin_signal_metadata_msg_t metadata;
 	nccl_net_ofi_gin_iputsignal_recv_req *req;
 	uint32_t peer_rank;
+	bool is_ack_requested;
 };
 
 /**
  * Done descriptor pushed by the worker thread back to the proxy. The
  * worker only does the gdrcopy read-modify-write; libfabric-side
- * bookkeeping (retire_completed_peer_iput_ops, send_ack) stays on
- * the proxy because libfabric EP affinity requires it.
+ * bookkeeping (ACK stash, return-req-to-pool) stays on the proxy
+ * because libfabric EP affinity requires it AND because ACK must
+ * not be released until after the device counter has been updated.
  */
 struct gin_signal_done_entry {
 	nccl_net_ofi_gin_iputsignal_recv_req *req;
 	uint32_t peer_rank;
 	uint16_t seq_num;
 	int status;
+	bool is_ack_requested;
 };
 
 class nccl_ofi_rdma_gin_put_comm : public nccl_ofi_gin_put_comm_t {

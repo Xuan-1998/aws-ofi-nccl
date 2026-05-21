@@ -338,6 +338,16 @@ private:
 	bool is_ack_requested = false;
 
 	/**
+	 * Set when this req has been handed off to the gdrcopy worker
+	 * but the device counter update has not yet been confirmed
+	 * (no done entry drained for this seq_num). Used by
+	 * retire_completed_peer_iput_ops to skip a req that is still
+	 * in-flight to the worker, preventing duplicate enqueue and
+	 * preserving the strong-signal ACK timing contract.
+	 */
+	bool worker_inflight = false;
+
+	/**
 	 * Metadata received as part of this request
 	 */
 	nccl_net_ofi_gin_signal_metadata_msg_t metadata;

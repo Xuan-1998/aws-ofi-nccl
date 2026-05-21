@@ -85,17 +85,25 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &r
 
 nccl_ofi_rdma_gin_put_comm::~nccl_ofi_rdma_gin_put_comm()
 {
-	/* Stop and join the gdrcopy worker thread. Force-wake any sleeper
-	 * via futex; the worker re-checks the stop flag after wake. */
+	/* Stop and join the gdrcopy worker thread. The worker may be
+	 * spinning inside its done-queue push (queue full, no consumer
+	 * because we are tearing down the proxy that would normally drain
+	 * it), so we must keep draining until the worker observes the
+	 * stop flag and exits its push loop. Without this interleave the
+	 * pthread_join and the worker's push-spin form a deadlock when
+	 * the done queue happens to be full at teardown. */
 	if (gdrcopy_thread_started.load(std::memory_order_acquire)) {
 		gdrcopy_thread_stop.store(1, std::memory_order_release);
 		gdrcopy_work_futex.store(1, std::memory_order_release);
 		syscall(SYS_futex, &gdrcopy_work_futex, FUTEX_WAKE, INT_MAX,
 			nullptr, nullptr, 0);
-		pthread_join(gdrcopy_thread, nullptr);
+
+		while (pthread_tryjoin_np(gdrcopy_thread, nullptr) == EBUSY) {
+			(void)drain_gdrcopy_done_queue();
+		}
 	}
 	/* Drain any leftover done-queue entries (best effort). */
-	drain_gdrcopy_done_queue();
+	(void)drain_gdrcopy_done_queue();
 
 #if HAVE_NVTX_TRACING
 	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
@@ -897,9 +905,16 @@ int nccl_ofi_rdma_gin_put_comm::do_gin_signal_and_trace(uint32_t peer_rank,
 						 req->metadata.header.seq_num, req);
 
 	/* Hand the gdrcopy work off to the worker thread when running. The
-	 * proxy reaps via drain_gdrcopy_done_queue() each progress tick.
-	 * Falls back to inline gdrcopy if the worker never started. */
+	 * proxy reaps via drain_gdrcopy_done_queue() each progress tick;
+	 * that drain is also where the matching ACK is stashed, the
+	 * outstanding-map entry is erased, and the req is returned to the
+	 * pool. Marking worker_inflight here causes retire_completed_peer_iput_ops
+	 * to skip this seq until drain confirms the device counter has
+	 * been updated -- preserves strong-signal ordering and avoids a
+	 * trace-tag UAF on a recycled req. Falls back to inline gdrcopy if
+	 * the worker never started. */
 	if (gdrcopy_thread_started.load(std::memory_order_acquire)) {
+		req->worker_inflight = true;
 		return enqueue_gdrcopy_work(peer_rank, req);
 	}
 
@@ -941,6 +956,7 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
 	w.metadata = req->metadata;
 	w.req = req;
 	w.peer_rank = peer_rank;
+	w.is_ack_requested = req->is_ack_requested;
 
 	while (!gdrcopy_work_queue.push(w)) {
 		wake_gdrcopy_worker();
@@ -950,10 +966,19 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
 	return 0;
 }
 
-/* Drain the worker's done queue. Each entry is a signal whose gdrcopy
- * has already been applied. The proxy logs failures here; libfabric-
- * side ack and retire bookkeeping is handled by the regular
- * iput_signal_recv_req_completion path on a later tick. */
+/* Drain the worker's done queue. Each entry is one signal whose gdrcopy
+ * (the actual device counter update) has been issued by the worker. ACK
+ * stash, the outstanding-map erase, and the return-to-pool ALL happen
+ * here so that:
+ *   (a) the ACK is not stashed before the device counter is updated
+ *       (strong-signal contract: peer must not observe ACK without also
+ *       observing the signal)
+ *   (b) the req pointer is not recycled before the worker is fully
+ *       finished with it (the SIGNAL_DELIVERY_END trace tag is the req
+ *       pointer; reuse would mis-tag the trace)
+ * Entries are drained in seq order because the SPSC ring preserves FIFO
+ * and the producer (retire path) submits in seq order, so stash_pending_ack's
+ * monotonicity contract still holds. */
 int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 {
 	gin_signal_done_entry d;
@@ -965,6 +990,38 @@ int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 			NCCL_OFI_WARN("gdrcopy worker failed for signal seq_num %hu (rc=%d)",
 				      d.seq_num, d.status);
 			ret = d.status;
+		}
+
+		/* Stash ACK only after the device counter has been updated by
+		 * the worker. */
+		if (d.is_ack_requested) {
+			int sret = stash_pending_ack(d.peer_rank, d.seq_num);
+			if (OFI_UNLIKELY(sret != 0)) {
+				ret = sret;
+			}
+		}
+
+		/* Erase the outstanding-map entry and return the req only now,
+		 * after every consumer of the req pointer (worker trace tag,
+		 * ACK stash) is done with it. */
+		uint64_t map_key = get_req_map_key(d.peer_rank, d.seq_num);
+		size_t n_removed =
+			this->outstanding_iput_signal_recv_reqs.erase(map_key);
+		assert_always(n_removed == 1);
+
+		/* Advance the per-peer delivery cursor only after the signal
+		 * has been delivered on the device. retire_completed_peer_iput_ops
+		 * may now see the next seq become ready. */
+		this->rank_comms[d.peer_rank].next_delivered_signal_seq_num =
+			(d.seq_num + 1) & GIN_IMM_SEQ_MASK;
+
+		this->resources.return_req_to_pool(d.req);
+
+		/* Newly advanced cursor may unblock subsequent in-order signals
+		 * whose segments already arrived while the worker was busy. */
+		int rret = retire_completed_peer_iput_ops(d.peer_rank);
+		if (OFI_UNLIKELY(rret != 0)) {
+			ret = rret;
 		}
 	}
 	return ret;
@@ -1002,7 +1059,15 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 			d.peer_rank = e.peer_rank;
 			d.seq_num = e.metadata.header.seq_num;
 			d.status = status;
+			d.is_ack_requested = e.is_ack_requested;
+			/* Bail out if the comm is being torn down. The
+			 * destructor is interleaving drain + tryjoin, but if
+			 * we sit forever in this push spin while it has not
+			 * yet drained an entry, we deadlock the join. */
 			while (!gdrcopy_done_queue.push(d)) {
+				if (gdrcopy_thread_stop.load(std::memory_order_acquire)) {
+					return;
+				}
 				asm volatile("" ::: "memory");
 			}
 		}
@@ -1068,7 +1133,15 @@ int nccl_ofi_rdma_gin_put_comm::iput_signal_recv_req_completion(uint32_t peer_ra
 		}
 	}
 
-	/* Remove this request entry from the map */
+	/* If do_gin_signal_and_trace handed the work off to the worker thread,
+	 * worker_inflight is now set; map erase + req return + ACK stash will
+	 * happen in drain_gdrcopy_done_queue. Otherwise (inline gdrcopy, or no
+	 * gdrcopy at all because metadata_received==false in strong mode), the
+	 * device counter is already updated and we can finalize here. */
+	if (req->worker_inflight) {
+		return 0;
+	}
+
 	size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(map_key);
 	assert_always(n_removed == 1);
 
@@ -1150,42 +1223,60 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 {
 	int ret = 0;
 
-	/* Process undelivered signals in order.  ACK coalescing is
-	   handled entirely by stash_pending_ack(), which merges
-	   ranges and flushes when they exceed GIN_ACK_INTERVAL. */
+	/* Process undelivered signals in order. ACK coalescing is handled by
+	   stash_pending_ack(), which merges ranges and flushes when they
+	   exceed GIN_ACK_INTERVAL.
+
+	   When the gdrcopy worker is running, do_gin_signal_and_trace returns
+	   asynchronously: it marks req->worker_inflight and the actual device
+	   counter update happens later. To preserve strong-signal ordering we
+	   must NOT release the ACK or advance next_delivered_signal_seq_num
+	   until the worker confirms the update -- those steps are done in
+	   drain_gdrcopy_done_queue, which calls back into this function once
+	   the cursor moves. */
 	while (true) {
 		auto &rank_comm = this->rank_comms[peer_rank];
 		uint16_t next_seq_num = rank_comm.next_delivered_signal_seq_num;
 
 		uint64_t map_key = get_req_map_key(peer_rank, next_seq_num);
 		auto it = this->outstanding_iput_signal_recv_reqs.find(map_key);
-		if (it != this->outstanding_iput_signal_recv_reqs.end()) {
-			auto *req = it->second;
-
-			if (req->num_seg_completions == req->total_segments) {
-				if (req->is_ack_requested) {
-					ret = stash_pending_ack(peer_rank, next_seq_num);
-					if (OFI_UNLIKELY(ret != 0)) {
-						return ret;
-					}
-				}
-				rank_comm.next_delivered_signal_seq_num =
-					(rank_comm.next_delivered_signal_seq_num + 1) &
-					GIN_IMM_SEQ_MASK;
-				ret = iput_signal_recv_req_completion(peer_rank, map_key, req);
-				if (OFI_UNLIKELY(ret != 0)) {
-					return ret;
-				}
-
-				this->resources.return_req_to_pool(req);
-			} else {
-				/* No more signals to deliver */
-				break;
-			}
-		} else {
-			/* No more signals to deliver */
+		if (it == this->outstanding_iput_signal_recv_reqs.end()) {
 			break;
 		}
+		auto *req = it->second;
+
+		if (req->num_seg_completions != req->total_segments) {
+			break;
+		}
+
+		if (req->worker_inflight) {
+			/* Already handed off; drain will finalize. */
+			break;
+		}
+
+		ret = iput_signal_recv_req_completion(peer_rank, map_key, req);
+		if (OFI_UNLIKELY(ret != 0)) {
+			return ret;
+		}
+
+		if (req->worker_inflight) {
+			/* Newly handed off in this call; drain will
+			 * finalize. Stop here so we don't advance the
+			 * cursor or release the ACK prematurely. */
+			break;
+		}
+
+		if (req->is_ack_requested) {
+			ret = stash_pending_ack(peer_rank, next_seq_num);
+			if (OFI_UNLIKELY(ret != 0)) {
+				return ret;
+			}
+		}
+		rank_comm.next_delivered_signal_seq_num =
+			(rank_comm.next_delivered_signal_seq_num + 1) &
+			GIN_IMM_SEQ_MASK;
+
+		this->resources.return_req_to_pool(req);
 	}
 
 	return ret;
@@ -1221,6 +1312,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 		req->metadata = *metadata_msg;
 		req->metadata_received = true;
 		req->is_ack_requested = true;  // Metadata always requests ACK
+		req->worker_inflight = false;  // Pool reuse: must reset
 		outstanding_iput_signal_recv_reqs[map_key] = req;
 	} else {
 		req = it->second;
@@ -1287,6 +1379,8 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data
 		req->num_seg_completions = 1;
 		req->total_segments = total_segms;
 		req->is_ack_requested = is_ack_requested;
+		req->metadata_received = false;  // Pool reuse: must reset
+		req->worker_inflight = false;    // Pool reuse: must reset
 		outstanding_iput_signal_recv_reqs[map_key] = req;
 	} else {
 		req = it->second;
