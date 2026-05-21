@@ -12,6 +12,7 @@
 #include "nccl_ofi_rdma.h"
 #include "nccl_ofi_tracepoint.h"
 
+#include <cerrno>
 #include <climits>
 #include <vector>
 
@@ -85,17 +86,24 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &r
 
 nccl_ofi_rdma_gin_put_comm::~nccl_ofi_rdma_gin_put_comm()
 {
-	/* Stop and join the gdrcopy worker thread. Force-wake any sleeper
-	 * via futex; the worker re-checks the stop flag after wake. */
+	/* Stop and join the gdrcopy worker thread. The worker may be
+	 * spinning inside its done-queue push (queue full, no consumer
+	 * because we are tearing down the proxy that would normally drain
+	 * it), so we keep draining the done queue while waiting for the
+	 * thread to exit. The worker also bails out of its push spin once
+	 * it observes the stop flag, so this loop is bounded. Without the
+	 * interleave, pthread_join + push-spin form a circular wait. */
 	if (gdrcopy_thread_started.load(std::memory_order_acquire)) {
 		gdrcopy_thread_stop.store(1, std::memory_order_release);
 		gdrcopy_work_futex.store(1, std::memory_order_release);
 		syscall(SYS_futex, &gdrcopy_work_futex, FUTEX_WAKE, INT_MAX,
 			nullptr, nullptr, 0);
-		pthread_join(gdrcopy_thread, nullptr);
+		while (pthread_tryjoin_np(gdrcopy_thread, nullptr) == EBUSY) {
+			(void)drain_gdrcopy_done_queue();
+		}
 	}
 	/* Drain any leftover done-queue entries (best effort). */
-	drain_gdrcopy_done_queue();
+	(void)drain_gdrcopy_done_queue();
 
 #if HAVE_NVTX_TRACING
 	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
@@ -1002,7 +1010,14 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 			d.peer_rank = e.peer_rank;
 			d.seq_num = e.metadata.header.seq_num;
 			d.status = status;
+			/* Bail out if the comm is being torn down. The
+			 * destructor is interleaving drain + tryjoin, but
+			 * if we sit forever in this push spin while it has
+			 * not yet drained an entry, we deadlock the join. */
 			while (!gdrcopy_done_queue.push(d)) {
+				if (gdrcopy_thread_stop.load(std::memory_order_acquire)) {
+					return;
+				}
 				asm volatile("" ::: "memory");
 			}
 		}
