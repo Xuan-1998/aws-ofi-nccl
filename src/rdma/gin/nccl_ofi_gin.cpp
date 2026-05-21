@@ -4,6 +4,8 @@
 
 #include "config.h"
 
+#include <vector>
+
 #include "rdma/gin/nccl_ofi_gin.h"
 
 #include "nccl_ofi_assert.h"
@@ -880,23 +882,18 @@ int nccl_ofi_rdma_gin_put_comm::do_gin_signal_and_trace(uint32_t peer_rank,
 int nccl_ofi_rdma_gin_put_comm::iput_signal_recv_req_completion(uint32_t peer_rank, uint64_t map_key,
 						       nccl_net_ofi_gin_iputsignal_recv_req *req)
 {
-	int ret = 0;
-
 	NCCL_OFI_TRACE(NCCL_NET, "Completed iputSignal seq num %hu on target",
 		       req->metadata.header.seq_num);
 
-	if (req->metadata_received && strong_signal_ordering_enabled) {
-		ret = do_gin_signal_and_trace(peer_rank, req);
-		if (ret != 0) {
-			return ret;
-		}
-	}
+	/* The signal r-m-w is now done by the caller after coalescing
+	   same-slot updates within a single retire pass (see
+	   retire_completed_peer_iput_ops). We only handle the bookkeeping
+	   step of removing this request entry from the map here. */
 
-	/* Remove this request entry from the map */
 	size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(map_key);
 	assert_always(n_removed == 1);
 
-	return ret;
+	return 0;
 }
 
 /* Extend the pending bundled ack to include seq_num. If the merged
@@ -968,45 +965,108 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 {
 	int ret = 0;
 
-	/* Process undelivered signals in order.  ACK coalescing is
-	   handled entirely by stash_pending_ack(), which merges
-	   ranges and flushes when they exceed GIN_ACK_INTERVAL. */
+	/* Process undelivered signals in order. ACK coalescing is handled
+	   entirely by stash_pending_ack(), which merges ranges and flushes
+	   when they exceed GIN_ACK_INTERVAL.
+
+	   Same-slot signal coalescing: when a recv burst lands many signals
+	   on the same (signal_base_address, signal_offset) before this pass
+	   runs, we fold them into a single gdrcopy r-m-w that adds the
+	   summed delta. The retire walk is the natural batch point because
+	   it already sees seq numbers in order, and the device-side counter
+	   only cares about the final accumulated value. */
+
+	struct collected_entry {
+		nccl_net_ofi_gin_iputsignal_recv_req *req;
+		uint64_t map_key;
+	};
+
+	thread_local std::vector<collected_entry> collected;
+	collected.clear();
+
 	while (true) {
 		auto &rank_comm = this->rank_comms[peer_rank];
 		uint16_t next_seq_num = rank_comm.next_delivered_signal_seq_num;
 
 		uint64_t map_key = get_req_map_key(peer_rank, next_seq_num);
 		auto it = this->outstanding_iput_signal_recv_reqs.find(map_key);
-		if (it != this->outstanding_iput_signal_recv_reqs.end()) {
-			auto *req = it->second;
-
-			if (req->num_seg_completions == req->total_segments) {
-				if (req->is_ack_requested) {
-					ret = stash_pending_ack(peer_rank, next_seq_num);
-					if (OFI_UNLIKELY(ret != 0)) {
-						return ret;
-					}
-				}
-				rank_comm.next_delivered_signal_seq_num =
-					(rank_comm.next_delivered_signal_seq_num + 1) &
-					GIN_IMM_SEQ_MASK;
-				ret = iput_signal_recv_req_completion(peer_rank, map_key, req);
-				if (OFI_UNLIKELY(ret != 0)) {
-					return ret;
-				}
-
-				this->resources.return_req_to_pool(req);
-			} else {
-				/* No more signals to deliver */
-				break;
-			}
-		} else {
-			/* No more signals to deliver */
+		if (it == this->outstanding_iput_signal_recv_reqs.end()) {
 			break;
+		}
+		auto *req = it->second;
+		if (req->num_seg_completions != req->total_segments) {
+			break;
+		}
+
+		if (req->is_ack_requested) {
+			ret = stash_pending_ack(peer_rank, next_seq_num);
+			if (OFI_UNLIKELY(ret != 0)) {
+				return ret;
+			}
+		}
+		rank_comm.next_delivered_signal_seq_num =
+			(rank_comm.next_delivered_signal_seq_num + 1) &
+			GIN_IMM_SEQ_MASK;
+
+		collected.push_back({req, map_key});
+	}
+
+	if (collected.empty()) {
+		return 0;
+	}
+
+	/* Merge same-(base, offset) deltas across the collected entries.
+	   Each merged group becomes one do_gin_signal call. The merge is
+	   associative and commutative because the device counter only
+	   cares about the final accumulated value. */
+	if (strong_signal_ordering_enabled) {
+		size_t i = 0;
+		while (i < collected.size()) {
+			auto *first_req = collected[i].req;
+			if (!first_req->metadata_received) {
+				++i;
+				continue;
+			}
+			nccl_net_ofi_gin_signal_metadata_msg_t md = first_req->metadata;
+			size_t j = i + 1;
+			for (; j < collected.size(); ++j) {
+				auto *jr = collected[j].req;
+				if (!jr->metadata_received) break;
+				if (jr->metadata.signal_base_address !=
+					first_req->metadata.signal_base_address ||
+				    jr->metadata.signal_offset !=
+					first_req->metadata.signal_offset) {
+					break;
+				}
+				md.signal_value += jr->metadata.signal_value;
+			}
+
+			NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_BEGIN(
+				dev, this, peer_rank,
+				first_req->metadata.header.seq_num, first_req);
+			int sret = do_gin_signal(md);
+			NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(
+				dev, this, peer_rank,
+				first_req->metadata.header.seq_num, first_req);
+			if (OFI_UNLIKELY(sret != 0)) {
+				NCCL_OFI_WARN("Failed to complete coalesced signal seq_num %lu",
+					      (unsigned long)first_req->metadata.header.seq_num);
+				return sret;
+			}
+			i = j;
 		}
 	}
 
-	return ret;
+	/* Tear down per-entry bookkeeping in the original order. */
+	for (auto &e : collected) {
+		ret = iput_signal_recv_req_completion(peer_rank, e.map_key, e.req);
+		if (OFI_UNLIKELY(ret != 0)) {
+			return ret;
+		}
+		this->resources.return_req_to_pool(e.req);
+	}
+
+	return 0;
 }
 
 int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
