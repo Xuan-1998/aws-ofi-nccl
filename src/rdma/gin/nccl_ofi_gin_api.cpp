@@ -63,10 +63,12 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 		return ncclInternalError;
 	}
 
-	/* Create per-communicator context to store the comm_id.
-	   This allows listen() to use comm_id as the endpoint key for
-	   endpoint lookup, giving each NCCL communicator its own
-	   endpoint instead of sharing one per thread. */
+	/* Create per-communicator context. The comm_id was historically used
+	   as the ep_table key in listen() so each NCCL communicator got its
+	   own endpoint, but listen() now always creates a fresh endpoint per
+	   call (one per GIN connection). The context is kept so the v13 ABI
+	   is unchanged and future per-communicator state has a place to
+	   live. */
 	try {
 		nccl_ofi_gin_context *context = new nccl_ofi_gin_context(commId);
 		*ctx = context;
@@ -131,14 +133,14 @@ static ncclResult_t nccl_ofi_gin_getProperties(int dev, ncclNetProperties_v11_t 
 
 ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listenComm)
 {
-	/* Extract communicator ID from GIN context */
+	/* Validate the GIN context. We no longer key endpoints by comm_id (see
+	 * below), but the context is still allocated by nccl_ofi_gin_init() and
+	 * a NULL ctx is a programming error. */
 	nccl_ofi_gin_context *context = static_cast<nccl_ofi_gin_context *>(ctx);
 	if (context == nullptr) {
 		NCCL_OFI_WARN("GIN listen: ctx is NULL");
 		return ncclInternalError;
 	}
-
-	uint64_t comm_id = context->comm_id;
 
 	auto plugin = nccl_net_ofi_get_plugin();
 	if (plugin == nullptr) {
@@ -153,17 +155,29 @@ ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listen
 	}
 
 	try {
-		/* Note: although the GIN plugin uses its own endpoint type, we still need
-		the transport endpoint to set up the bootstrap AG ring.
+		/* Note: although the GIN plugin uses its own endpoint type, we
+		   still need the transport endpoint to set up the bootstrap AG
+		   ring.
 
-		Use comm_id as endpoint_key to ensure all GIN contexts within the same
-		communicator share the same endpoint. This creates one endpoint per
-		communicator instead of one per thread.
-		
-		domain_key=0 uses the default domain, endpoint_key=comm_id caches endpoints
-		by communicator ID instead of thread ID. */
+		   Always create a fresh endpoint per listen() call rather than
+		   reusing one from the domain's ep_table. NCCL now spawns one
+		   GIN progress thread per connection, and each connection
+		   should drive its own endpoint to avoid serialising
+		   completion-queue traffic across connections. The endpoint's
+		   lifetime is owned by the listen_comm via the shared_ptr
+		   below; it is never inserted into the ep_table. */
 
-		auto ep = device->get_ep(0, static_cast<long>(comm_id));
+		auto domain = device->get_domain(0);
+		if (domain == nullptr) {
+			NCCL_OFI_WARN("GIN: failed to get domain on device %i.", dev);
+			return ncclInternalError;
+		}
+
+		auto ep = domain->create_endpoint();
+		if (ep == nullptr) {
+			NCCL_OFI_WARN("GIN: failed to create endpoint on device %i.", dev);
+			return ncclSystemError;
+		}
 
 		nccl_net_ofi_listen_comm *l_comm = nullptr;
 		int ret = ep->listen(static_cast<nccl_net_ofi_conn_handle_t *>(handle), &l_comm);
