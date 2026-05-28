@@ -523,6 +523,8 @@ private:
 	std::atomic<uint64_t> smart_match_pops{0};
 	std::atomic<uint64_t> smart_match_dist_hist[16] = {};
 	std::atomic<uint64_t> qdepth_drain_calls{0};
+	std::atomic<uint64_t> entries_window_total{0};
+	std::atomic<uint64_t> distinct_window_total{0};
 	std::atomic<int> gdrcopy_thread_stop{0};
 	std::atomic<int> gdrcopy_thread_started{0};
 	nccl_ofi_gin_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;

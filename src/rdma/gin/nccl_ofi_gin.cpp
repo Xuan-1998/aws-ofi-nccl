@@ -847,10 +847,14 @@ int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 			if (n < 0 || n >= (int)(sizeof(sdbuf) - soff)) break;
 			soff += n;
 		}
+		uint64_t ent_tot = entries_window_total.load();
+		uint64_t dis_tot = distinct_window_total.load();
 		NCCL_OFI_INFO(NCCL_NET, "GIN_QDEPTH_NOGREEDY comm=%p outer_pops=%lu smart_pops=%lu "
+		              "window_entries=%lu window_distinct=%lu "
 		              "qdepth[0-1,2-3,4-7,8-15,16-31,32-63,64-127,128-255,...]=%s "
 		              "smart_dist[1,2-3,4-7,8-15,16-31,32-63,...]=%s",
 		              (void*)this, (unsigned long)outer_pops, (unsigned long)smart_pops,
+		              (unsigned long)ent_tot, (unsigned long)dis_tot,
 		              qdbuf, sdbuf);
 	}
 		gin_signal_done_entry d;
@@ -896,16 +900,33 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 			uint32_t depth_bucket = 0;
 			{ int v = peek_n; while (v > 1 && depth_bucket < 15) { v >>= 1; ++depth_bucket; } }
 			qdepth_hist[depth_bucket].fetch_add(1, std::memory_order_relaxed);
+			bool found_match = false;
 			for (int i = 0; i < peek_n; ++i) {
-				if (peek_buf[i].metadata.signal_base_address == w.metadata.signal_base_address &&
+				if (!found_match &&
+				    peek_buf[i].metadata.signal_base_address == w.metadata.signal_base_address &&
 				    peek_buf[i].metadata.signal_offset == w.metadata.signal_offset) {
 					smart_match_pops.fetch_add(1, std::memory_order_relaxed);
 					uint32_t dbucket = 0;
 					{ int v = i + 1; while (v > 1 && dbucket < 15) { v >>= 1; ++dbucket; } }
 					smart_match_dist_hist[dbucket].fetch_add(1, std::memory_order_relaxed);
-					break;
+					found_match = true;
 				}
 			}
+			/* distinct slots in {W} U peek_buf[0..peek_n-1] */
+			int distinct = 1;
+			for (int i = 0; i < peek_n; ++i) {
+				bool seen = (peek_buf[i].metadata.signal_base_address == w.metadata.signal_base_address &&
+				             peek_buf[i].metadata.signal_offset == w.metadata.signal_offset);
+				for (int j = 0; !seen && j < i; ++j) {
+					if (peek_buf[i].metadata.signal_base_address == peek_buf[j].metadata.signal_base_address &&
+					    peek_buf[i].metadata.signal_offset == peek_buf[j].metadata.signal_offset) {
+						seen = true;
+					}
+				}
+				if (!seen) ++distinct;
+			}
+			entries_window_total.fetch_add((uint64_t)(peek_n + 1), std::memory_order_relaxed);
+			distinct_window_total.fetch_add((uint64_t)distinct, std::memory_order_relaxed);
 		}
 
 		int status = do_gin_signal(w.metadata);
