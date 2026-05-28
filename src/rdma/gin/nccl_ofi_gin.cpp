@@ -33,6 +33,7 @@ xj_recv_set(nccl_ofi_gin_peer_rank_info &p, uint16_t seq,
 #include "nccl_ofi_tracepoint.h"
 
 #include <vector>
+#include <signal.h>
 
 struct gin_connect_handle {
 	/* Number of rails */
@@ -852,8 +853,32 @@ void *nccl_ofi_rdma_gin_put_comm::gdrcopy_thread_entry(void *arg)
 	return nullptr;
 }
 
+/* SIGUSR1 dump trigger: handler bumps a global generation counter;
+ * each worker keeps a private "last seen" generation and dumps when
+ * the global has advanced. The handler itself only does an atomic
+ * store, which is async-signal-safe; the actual NCCL_OFI_INFO call
+ * happens in the worker's normal context. */
+static std::atomic<int> g_qdepth_dump_gen{0};
+static std::once_flag g_qdepth_sig_init_once;
+
+extern "C" void qdepth_sigusr1_handler(int /*sig*/)
+{
+	g_qdepth_dump_gen.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void qdepth_init_signal_handler()
+{
+	struct sigaction sa = {};
+	sa.sa_handler = qdepth_sigusr1_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	sigaction(SIGUSR1, &sa, nullptr);
+}
+
 void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 {
+	std::call_once(g_qdepth_sig_init_once, qdepth_init_signal_handler);
+
 	/* Coalesce buffer: collected work entries that target the same
 	 * (signal_base_address, signal_offset) slot are folded into a single
 	 * gdrcopy +N call. The reporting descriptors still flow back to the
@@ -890,6 +915,34 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 			 * worker pegs one core. */
 			asm volatile("" ::: "memory");
 			continue;
+		}
+
+		/* --- queue depth at outer pop --- */
+		qdepth_outer_pops.fetch_add(1, std::memory_order_relaxed);
+		{
+			int depth = gdrcopy_work_queue.size();
+			uint32_t bucket = 0;
+			{ int v = depth; while (v > 1 && bucket < 15) { v >>= 1; ++bucket; } }
+			qdepth_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+		}
+
+		/* --- SIGUSR1 dump (cheap path: one atomic load + branch) --- */
+		{
+			int g = g_qdepth_dump_gen.load(std::memory_order_relaxed);
+			if (g != qdepth_seen_gen) {
+				qdepth_seen_gen = g;
+				uint64_t outer_pops = qdepth_outer_pops.load();
+				char qdbuf[256] = {0}; int off = 0;
+				for (int i = 0; i < 16; ++i) {
+					uint64_t b = qdepth_hist[i].load();
+					int n = snprintf(qdbuf + off, sizeof(qdbuf) - off, "%lu ", (unsigned long)b);
+					if (n < 0 || n >= (int)(sizeof(qdbuf) - off)) break;
+					off += n;
+				}
+				NCCL_OFI_INFO(NCCL_NET, "GIN_QDEPTH comm=%p outer_pops=%lu "
+				              "qdepth[0,1,2,3-4,5-8,9-16,17-32,33-64,...]=%s",
+				              (void*)this, (unsigned long)outer_pops, qdbuf);
+			}
 		}
 
 		/* Continue the open run when the next item targets the same
