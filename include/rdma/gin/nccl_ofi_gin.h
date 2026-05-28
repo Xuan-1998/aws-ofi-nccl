@@ -211,6 +211,11 @@ public:
 		tail.store((t + 1) % CAPACITY, std::memory_order_release);
 		return true;
 	}
+	int size() const {
+		int hh = head.load(std::memory_order_acquire);
+		int tt = tail.load(std::memory_order_acquire);
+		return (hh + CAPACITY - tt) % CAPACITY;
+	}
 };
 
 /**
@@ -500,6 +505,11 @@ private:
 	 * gdrcopy_done_queue. The proxy drains the done queue every progress
 	 * tick. */
 	pthread_t gdrcopy_thread;
+
+	/* qdepth at outer pop (stats only) */
+	std::atomic<uint64_t> qdepth_outer_pops{0};
+	std::atomic<uint64_t> qdepth_hist[16] = {};
+	std::atomic<uint64_t> qdepth_drain_calls{0};
 	std::atomic<int> gdrcopy_thread_stop{0};
 	std::atomic<int> gdrcopy_thread_started{0};
 	nccl_ofi_gin_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;
