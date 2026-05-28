@@ -829,7 +829,45 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
  * iput_signal_recv_req_completion path on a later tick. */
 int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 {
-	gin_signal_done_entry d;
+	uint64_t prev_drain = coalesce_drain_calls.fetch_add(1, std::memory_order_relaxed);
+	if ((prev_drain & 0x1FFF) == 0 && prev_drain > 0) {
+		uint64_t works = coalesce_total_works.load();
+		uint64_t groups = coalesce_total_groups.load();
+		uint64_t maxg = coalesce_max_group.load();
+		double factor = (groups > 0) ? (double)works / (double)groups : 0.0;
+		char histbuf[256] = {0}; int off = 0;
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = coalesce_hist[i].load();
+			int w2 = snprintf(histbuf + off, sizeof(histbuf) - off, "%lu ", (unsigned long)b);
+			if (w2 < 0 || w2 >= (int)(sizeof(histbuf) - off)) break;
+			off += w2;
+		}
+		char qdbuf[256] = {0}; int qoff = 0;
+		uint64_t outer_pops = qdepth_outer_pops.load();
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = qdepth_hist[i].load();
+			int w2 = snprintf(qdbuf + qoff, sizeof(qdbuf) - qoff, "%lu ", (unsigned long)b);
+			if (w2 < 0 || w2 >= (int)(sizeof(qdbuf) - qoff)) break;
+			qoff += w2;
+		}
+		char sdbuf[256] = {0}; int soff = 0;
+		uint64_t smart_pops = smart_match_pops.load();
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = smart_match_dist_hist[i].load();
+			int w2 = snprintf(sdbuf + soff, sizeof(sdbuf) - soff, "%lu ", (unsigned long)b);
+			if (w2 < 0 || w2 >= (int)(sizeof(sdbuf) - soff)) break;
+			soff += w2;
+		}
+		NCCL_OFI_INFO(NCCL_NET, "GIN_COALESCE_STATS_PERIODIC comm=%p drains=%lu "
+		              "works=%lu groups=%lu factor=%.3f max_group=%lu hist=%s "
+		              "outer_pops=%lu qdepth[0,1,2,3-4,5-8,9-16,17-32,33-64,...]=%s "
+		              "smart_pops=%lu smart_dist[1,2,3-4,5-8,9-16,17-32,33-64,...]=%s",
+		              (void*)this, (unsigned long)prev_drain, (unsigned long)works,
+		              (unsigned long)groups, factor, (unsigned long)maxg, histbuf,
+		              (unsigned long)outer_pops, qdbuf,
+		              (unsigned long)smart_pops, sdbuf);
+	}
+		gin_signal_done_entry d;
 	int ret = 0;
 	while (gdrcopy_done_queue.pop(d)) {
 		NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, d.peer_rank,
@@ -867,6 +905,17 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 		for (auto &e : run) merged += e.metadata.signal_value;
 		nccl_net_ofi_gin_signal_metadata_msg_t md = run.front().metadata;
 		md.signal_value = merged;
+		/* stats: count this group + group size histogram */
+		{
+			uint64_t gsize = (uint64_t)run.size();
+			coalesce_total_works.fetch_add(gsize, std::memory_order_relaxed);
+			coalesce_total_groups.fetch_add(1, std::memory_order_relaxed);
+			uint64_t prev_max = coalesce_max_group.load(std::memory_order_relaxed);
+			while (gsize > prev_max && !coalesce_max_group.compare_exchange_weak(prev_max, gsize, std::memory_order_relaxed)) {}
+			uint32_t bucket = 0;
+			{ uint64_t v = gsize; while (v > 1 && bucket < 15) { v >>= 1; ++bucket; } }
+			coalesce_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+		}
 
 		int status = do_gin_signal(md);
 		for (auto &e : run) {
@@ -890,6 +939,27 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 			 * worker pegs one core. */
 			asm volatile("" ::: "memory");
 			continue;
+		}
+
+		/* --- queue inspection at outer pop: this is where a smart
+		 * coalescer could outperform greedy by looking ahead --- */
+		qdepth_outer_pops.fetch_add(1, std::memory_order_relaxed);
+		{
+			gin_signal_work_entry peek_buf[64];
+			int peek_n = gdrcopy_work_queue.snapshot(peek_buf, 64);
+			uint32_t depth_bucket = 0;
+			{ int v = peek_n; while (v > 1 && depth_bucket < 15) { v >>= 1; ++depth_bucket; } }
+			qdepth_hist[depth_bucket].fetch_add(1, std::memory_order_relaxed);
+			for (int i = 0; i < peek_n; ++i) {
+				if (peek_buf[i].metadata.signal_base_address == w.metadata.signal_base_address &&
+				    peek_buf[i].metadata.signal_offset == w.metadata.signal_offset) {
+					smart_match_pops.fetch_add(1, std::memory_order_relaxed);
+					uint32_t dbucket = 0;
+					{ uint32_t v = i + 1; while (v > 1 && dbucket < 15) { v >>= 1; ++dbucket; } }
+					smart_match_dist_hist[dbucket].fetch_add(1, std::memory_order_relaxed);
+					break;
+				}
+			}
 		}
 
 		/* Continue the open run when the next item targets the same
