@@ -829,7 +829,31 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
  * iput_signal_recv_req_completion path on a later tick. */
 int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 {
-	gin_signal_done_entry d;
+	uint64_t prev = qdepth_drain_calls.fetch_add(1, std::memory_order_relaxed);
+	if ((prev & 0x1FFF) == 0 && prev > 0) {
+		uint64_t outer_pops = qdepth_outer_pops.load();
+		uint64_t smart_pops = smart_match_pops.load();
+		char qdbuf[256] = {0}; int off = 0;
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = qdepth_hist[i].load();
+			int n = snprintf(qdbuf + off, sizeof(qdbuf) - off, "%lu ", (unsigned long)b);
+			if (n < 0 || n >= (int)(sizeof(qdbuf) - off)) break;
+			off += n;
+		}
+		char sdbuf[256] = {0}; int soff = 0;
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = smart_match_dist_hist[i].load();
+			int n = snprintf(sdbuf + soff, sizeof(sdbuf) - soff, "%lu ", (unsigned long)b);
+			if (n < 0 || n >= (int)(sizeof(sdbuf) - soff)) break;
+			soff += n;
+		}
+		NCCL_OFI_INFO(NCCL_NET, "GIN_QDEPTH_NOGREEDY comm=%p outer_pops=%lu smart_pops=%lu "
+		              "qdepth[0-1,2-3,4-7,8-15,16-31,32-63,64-127,128-255,...]=%s "
+		              "smart_dist[1,2-3,4-7,8-15,16-31,32-63,...]=%s",
+		              (void*)this, (unsigned long)outer_pops, (unsigned long)smart_pops,
+		              qdbuf, sdbuf);
+	}
+		gin_signal_done_entry d;
 	int ret = 0;
 	while (gdrcopy_done_queue.pop(d)) {
 		NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, d.peer_rank,
@@ -862,6 +886,26 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 			 * worker pegs one core. */
 			asm volatile("" ::: "memory");
 			continue;
+		}
+
+		/* --- qdepth + smart-match measurement at outer pop --- */
+		qdepth_outer_pops.fetch_add(1, std::memory_order_relaxed);
+		{
+			gin_signal_work_entry peek_buf[64];
+			int peek_n = gdrcopy_work_queue.snapshot(peek_buf, 64);
+			uint32_t depth_bucket = 0;
+			{ int v = peek_n; while (v > 1 && depth_bucket < 15) { v >>= 1; ++depth_bucket; } }
+			qdepth_hist[depth_bucket].fetch_add(1, std::memory_order_relaxed);
+			for (int i = 0; i < peek_n; ++i) {
+				if (peek_buf[i].metadata.signal_base_address == w.metadata.signal_base_address &&
+				    peek_buf[i].metadata.signal_offset == w.metadata.signal_offset) {
+					smart_match_pops.fetch_add(1, std::memory_order_relaxed);
+					uint32_t dbucket = 0;
+					{ int v = i + 1; while (v > 1 && dbucket < 15) { v >>= 1; ++dbucket; } }
+					smart_match_dist_hist[dbucket].fetch_add(1, std::memory_order_relaxed);
+					break;
+				}
+			}
 		}
 
 		int status = do_gin_signal(w.metadata);
