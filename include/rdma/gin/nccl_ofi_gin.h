@@ -510,6 +510,9 @@ private:
 	std::atomic<uint64_t> qdepth_outer_pops{0};
 	std::atomic<uint64_t> qdepth_hist[16] = {};
 	std::atomic<uint64_t> qdepth_drain_calls{0};
+	std::atomic<uint64_t> gdrcopy_calls{0};
+	std::atomic<uint64_t> entries_processed{0};
+	std::atomic<uint64_t> group_size_hist[16] = {};
 	std::atomic<int> gdrcopy_thread_stop{0};
 	std::atomic<int> gdrcopy_thread_started{0};
 	nccl_ofi_gin_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;
