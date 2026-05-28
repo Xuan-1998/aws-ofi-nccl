@@ -839,9 +839,20 @@ int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 			if (n < 0 || n >= (int)(sizeof(qdbuf) - off)) break;
 			off += n;
 		}
-		NCCL_OFI_INFO(NCCL_NET, "GIN_QDEPTH comm=%p outer_pops=%lu "
-		              "qdepth[0-1,2-3,4-7,8-15,16-31,32-63,64-127,128-255,...]=%s",
-		              (void*)this, (unsigned long)outer_pops, qdbuf);
+		uint64_t gc = gdrcopy_calls.load();
+		uint64_t ep = entries_processed.load();
+		char gsbuf[256] = {0}; int goff = 0;
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = group_size_hist[i].load();
+			int n = snprintf(gsbuf + goff, sizeof(gsbuf) - goff, "%lu ", (unsigned long)b);
+			if (n < 0 || n >= (int)(sizeof(gsbuf) - goff)) break;
+			goff += n;
+		}
+		NCCL_OFI_INFO(NCCL_NET, "GIN_QDEPTH comm=%p outer_pops=%lu gdrcopy_calls=%lu entries=%lu "
+		              "qdepth[0-1,2-3,4-7,8-15,16-31,32-63,64-127,128-255,...]=%s "
+		              "groupsz[1,2-3,4-7,8-15,16-31,32-63,...]=%s",
+		              (void*)this, (unsigned long)outer_pops,
+		              (unsigned long)gc, (unsigned long)ep, qdbuf, gsbuf);
 	}
 		gin_signal_done_entry d;
 	int ret = 0;
@@ -877,6 +888,15 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 
 	auto apply_run = [&]() {
 		if (run.empty()) return;
+		/* fold-rate measurement */
+		{
+			size_t sz = run.size();
+			gdrcopy_calls.fetch_add(1, std::memory_order_relaxed);
+			entries_processed.fetch_add((uint64_t)sz, std::memory_order_relaxed);
+			uint32_t bucket = 0;
+			{ size_t v = sz; while (v > 1 && bucket < 15) { v >>= 1; ++bucket; } }
+			group_size_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+		}
 		uint64_t merged = 0;
 		for (auto &e : run) merged += e.metadata.signal_value;
 		nccl_net_ofi_gin_signal_metadata_msg_t md = run.front().metadata;
