@@ -442,7 +442,8 @@ static ncclResult_t nccl_ofi_gin_destroyContext_v13(void *ginCtx)
 
 static ncclResult_t nccl_ofi_gin_iput_v13(void *ginCtx, int context, uint64_t srcOff,
 					  void *srcMhandle, size_t size, uint64_t dstOff,
-					  void *dstMhandle, uint32_t rank, void **request)
+					  void *dstMhandle, uint32_t rank, bool aggregate,
+					  void **request)
 {
 	return nccl_ofi_gin_iput(ginCtx, srcOff, srcMhandle, size,
 				 dstOff, dstMhandle, rank, request);
@@ -452,7 +453,7 @@ static ncclResult_t nccl_ofi_gin_iputSignal_v13(void *ginCtx, int context, uint6
 						void *srcMhandle, size_t size, uint64_t dstOff,
 						void *dstMhandle, uint32_t rank, uint64_t signalOff,
 						void *signalMhandle, uint64_t signalValue,
-						uint32_t signalOp, void **request)
+						uint32_t signalOp, bool aggregate, void **request)
 {
 	return nccl_ofi_gin_iputSignal(ginCtx, srcOff, srcMhandle, size,
 				       dstOff, dstMhandle, rank, signalOff, signalMhandle,
