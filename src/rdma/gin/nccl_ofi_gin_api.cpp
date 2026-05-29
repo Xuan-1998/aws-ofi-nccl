@@ -313,7 +313,8 @@ static ncclResult_t nccl_ofi_gin_test(void *collComm, void *request, int *done)
 static ncclResult_t nccl_ofi_gin_iputSignal(void *collComm, uint64_t srcOff, void *srcMhandle,
 					    size_t size, uint64_t dstOff, void *dstMhandle,
 					    uint32_t rank, uint64_t signalOff, void *signalMhandle,
-					    uint64_t signalValue, uint32_t signalOp, void **request)
+					    uint64_t signalValue, uint32_t signalOp, bool aggregate,
+					    void **request)
 {
 	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
 	auto *src_mr_handle = static_cast<nccl_ofi_gin_symm_mr_handle_t *>(srcMhandle);
@@ -322,7 +323,7 @@ static ncclResult_t nccl_ofi_gin_iputSignal(void *collComm, uint64_t srcOff, voi
 
 	nccl_ofi_gin_req_t *req = nullptr;
 	int ret = gin_comm->iputSignal(srcOff, src_mr_handle, size, dstOff, dst_mr_handle, rank,
-				       signalOff, signal_mr_handle, signalValue, signalOp, &req);
+				       signalOff, signal_mr_handle, signalValue, signalOp, aggregate, &req);
 	if (ret != 0) {
 		return nccl_net_ofi_retval_translate(ret);
 	}
@@ -333,12 +334,12 @@ static ncclResult_t nccl_ofi_gin_iputSignal(void *collComm, uint64_t srcOff, voi
 
 static ncclResult_t nccl_ofi_gin_iput(void *collComm, uint64_t srcOff, void *srcMhandle,
 				      size_t size, uint64_t dstOff, void *dstMhandle, uint32_t rank,
-				      void **request)
+				      bool aggregate, void **request)
 {
 	/* Currently, due to ordering requirements, iput is just implemented as an
 	   iputSignal with a zero'd signal address (instead of a write-without-immediate) */
 	return nccl_ofi_gin_iputSignal(collComm, srcOff, srcMhandle, size, dstOff, dstMhandle, rank,
-				       0, nullptr, 0, 0, request);
+				       0, nullptr, 0, 0, aggregate, request);
 }
 
 static ncclResult_t nccl_ofi_gin_iget(void *collComm, uint64_t remoteOff, void *remoteMhandle,
@@ -446,7 +447,7 @@ static ncclResult_t nccl_ofi_gin_iput_v13(void *ginCtx, int context, uint64_t sr
 					  void **request)
 {
 	return nccl_ofi_gin_iput(ginCtx, srcOff, srcMhandle, size,
-				 dstOff, dstMhandle, rank, request);
+				 dstOff, dstMhandle, rank, aggregate, request);
 }
 
 static ncclResult_t nccl_ofi_gin_iputSignal_v13(void *ginCtx, int context, uint64_t srcOff,
@@ -457,7 +458,7 @@ static ncclResult_t nccl_ofi_gin_iputSignal_v13(void *ginCtx, int context, uint6
 {
 	return nccl_ofi_gin_iputSignal(ginCtx, srcOff, srcMhandle, size,
 				       dstOff, dstMhandle, rank, signalOff, signalMhandle,
-				       signalValue, signalOp, request);
+				       signalValue, signalOp, aggregate, request);
 }
 
 static ncclResult_t nccl_ofi_gin_iget_v13(void *ginCtx, int context, uint64_t remoteOff,
@@ -484,6 +485,24 @@ static ncclResult_t nccl_ofi_gin_iflush_v13(void *ginCtx, int context, void *mha
 	return ncclSuccess;
 }
 
+/* v11 has no aggregate hint: forward aggregate=false to the shared impls. */
+static ncclResult_t nccl_ofi_gin_iput_v11(void *collComm, uint64_t srcOff, void *srcMhandle,
+					  size_t size, uint64_t dstOff, void *dstMhandle, uint32_t rank,
+					  void **request)
+{
+	return nccl_ofi_gin_iput(collComm, srcOff, srcMhandle, size, dstOff, dstMhandle, rank,
+				 false, request);
+}
+
+static ncclResult_t nccl_ofi_gin_iputSignal_v11(void *collComm, uint64_t srcOff, void *srcMhandle,
+						size_t size, uint64_t dstOff, void *dstMhandle,
+						uint32_t rank, uint64_t signalOff, void *signalMhandle,
+						uint64_t signalValue, uint32_t signalOp, void **request)
+{
+	return nccl_ofi_gin_iputSignal(collComm, srcOff, srcMhandle, size, dstOff, dstMhandle, rank,
+				       signalOff, signalMhandle, signalValue, signalOp, false, request);
+}
+
 NCCL_OFI_EXPORT_SYMBOL ncclGin_v11_t ncclGinPlugin_v11 = {
 	/* Since there is no equivalent of NCCL_NET for GIN, currently we don't
 	   have name fixup depending on env var like nvidia_plugin_name_fixup().
@@ -503,8 +522,8 @@ NCCL_OFI_EXPORT_SYMBOL ncclGin_v11_t ncclGinPlugin_v11 = {
 	.destroyContext = nullptr,
 	.closeColl = nccl_ofi_gin_closeColl,
 	.closeListen = nccl_ofi_gin_closeListen,
-	.iput = nccl_ofi_gin_iput,
-	.iputSignal = nccl_ofi_gin_iputSignal,
+	.iput = nccl_ofi_gin_iput_v11,
+	.iputSignal = nccl_ofi_gin_iputSignal_v11,
 	.test = nccl_ofi_gin_test,
 	.ginProgress = nccl_ofi_gin_ginProgress,
 	/* Not used by NCCL in proxy mode */

@@ -346,7 +346,7 @@ public:
 	int iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr_handle_t *srcMhandle, size_t size, uint64_t dstOff,
 		       nccl_ofi_gin_symm_mr_handle_t *dstMhandle, uint32_t rank, uint64_t signalOff,
 		       nccl_ofi_gin_symm_mr_handle_t *signalMhandle, uint64_t signalValue, uint32_t signalOp,
-		       nccl_ofi_gin_req_t **request) override;
+		       bool aggregate, nccl_ofi_gin_req_t **request) override;
 
 	int iget(uint64_t remoteOff, nccl_ofi_gin_symm_mr_handle_t *remoteMhandle,
 		 size_t size, uint64_t localOff, nccl_ofi_gin_symm_mr_handle_t *localMhandle,
@@ -421,6 +421,11 @@ private:
 	// FIXME: Get rid of freelist_deleter and change to embedded
 	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> metadata_fl;
 	int dev;
+
+	/* Rail pinned across an aggregated iputSignal sequence: when an op is
+	   posted with FI_MORE, the next op must reuse this rail to flush it.
+	   -1 means no pin (consult get_next_rail()). Guarded by ep_lock. */
+	int pinned_rail_id = -1;
 
 	/* --- TIER 2: Receiver side — every CQ completion --- */
 	/* Controls signal delivery ordering on this communicator

@@ -83,7 +83,7 @@ public:
 			       uint32_t rank, uint64_t signalOff,
 			       nccl_ofi_gin_symm_mr_handle_t *signalMhandle,
 			       uint64_t signalValue, uint32_t signalOp,
-			       nccl_ofi_gin_req_t **request) = 0;
+			       bool aggregate, nccl_ofi_gin_req_t **request) = 0;
 
 	virtual int iget(uint64_t remoteOff, nccl_ofi_gin_symm_mr_handle_t *remoteMhandle,
 			 size_t size, uint64_t localOff,
