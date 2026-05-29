@@ -816,6 +816,26 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
 	w.req = req;
 	w.peer_rank = peer_rank;
 
+	/* enqueue-side adjacency probe */
+	{
+		enqueue_calls.fetch_add(1, std::memory_order_relaxed);
+		uint64_t base = w.metadata.signal_base_address;
+		uint64_t off  = w.metadata.signal_offset;
+		if (base == enq_last_slot_base && off == enq_last_slot_offset) {
+			enqueue_same_as_prev.fetch_add(1, std::memory_order_relaxed);
+			if (enq_cur_runlen < 0xFFFFFFFFu) ++enq_cur_runlen;
+		} else {
+			if (enq_cur_runlen > 0) {
+				uint32_t bucket = 0; uint32_t v = enq_cur_runlen;
+				while (v > 1 && bucket < 15) { v >>= 1; ++bucket; }
+				enqueue_runlen_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+			}
+			enq_cur_runlen = 1;
+			enq_last_slot_base = base;
+			enq_last_slot_offset = off;
+		}
+	}
+
 	while (!gdrcopy_work_queue.push(w)) {
 		drain_gdrcopy_done_queue();
 		asm volatile("" ::: "memory");
@@ -848,11 +868,24 @@ int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 			if (n < 0 || n >= (int)(sizeof(gsbuf) - goff)) break;
 			goff += n;
 		}
+		uint64_t ec = enqueue_calls.load();
+		uint64_t es = enqueue_same_as_prev.load();
+		char rlbuf[256] = {0}; int roff = 0;
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = enqueue_runlen_hist[i].load();
+			int n = snprintf(rlbuf + roff, sizeof(rlbuf) - roff, "%lu ", (unsigned long)b);
+			if (n < 0 || n >= (int)(sizeof(rlbuf) - roff)) break;
+			roff += n;
+		}
 		NCCL_OFI_INFO(NCCL_NET, "GIN_QDEPTH comm=%p outer_pops=%lu gdrcopy_calls=%lu entries=%lu "
+		              "enqueue_calls=%lu enqueue_same_as_prev=%lu "
 		              "qdepth[0-1,2-3,4-7,8-15,16-31,32-63,64-127,128-255,...]=%s "
-		              "groupsz[1,2-3,4-7,8-15,16-31,32-63,...]=%s",
+		              "groupsz[1,2-3,4-7,8-15,16-31,32-63,...]=%s "
+		              "enq_runlen[1,2-3,4-7,8-15,16-31,32-63,...]=%s",
 		              (void*)this, (unsigned long)outer_pops,
-		              (unsigned long)gc, (unsigned long)ep, qdbuf, gsbuf);
+		              (unsigned long)gc, (unsigned long)ep,
+		              (unsigned long)ec, (unsigned long)es,
+		              qdbuf, gsbuf, rlbuf);
 	}
 		gin_signal_done_entry d;
 	int ret = 0;
@@ -1126,6 +1159,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	}
 
 	uint64_t map_key = get_req_map_key(peer_rank, msg_seq_num);
+	(void)map_key;
 
 	nccl_net_ofi_gin_iputsignal_recv_req *req = xj_recv_get(rank_comms[peer_rank], msg_seq_num);
 	if (req == nullptr) {
@@ -1190,6 +1224,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data
 
 	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
 	uint64_t map_key = get_req_map_key(peer_rank, msg_seq_num);
+	(void)map_key;
 
 	int ret = 0;
 

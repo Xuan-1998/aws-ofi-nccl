@@ -513,6 +513,13 @@ private:
 	std::atomic<uint64_t> gdrcopy_calls{0};
 	std::atomic<uint64_t> entries_processed{0};
 	std::atomic<uint64_t> group_size_hist[16] = {};
+	/* enqueue-side adjacency probe (proxy thread only, no atomics needed) */
+	uint64_t enq_last_slot_base{0};
+	uint64_t enq_last_slot_offset{(uint64_t)-1};
+	uint32_t enq_cur_runlen{0};
+	std::atomic<uint64_t> enqueue_calls{0};
+	std::atomic<uint64_t> enqueue_same_as_prev{0};
+	std::atomic<uint64_t> enqueue_runlen_hist[16] = {};
 	std::atomic<int> gdrcopy_thread_stop{0};
 	std::atomic<int> gdrcopy_thread_started{0};
 	nccl_ofi_gin_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;
