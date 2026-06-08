@@ -1089,9 +1089,8 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 	bool ack_requested = false;
 
 	/* Walk in-order delivered ops, advancing rx_consumed as we go. The
-	   sender's flow-control window opens up as soon as we ack progress
-	   either via piggyback on outbound metadata (in iputSignal) or via
-	   a standalone ACK (maybe_send_ack at the end of this function).
+	   sender's flow-control window opens once we send back a standalone
+	   ACK (maybe_send_ack at the end of this function).
 
 	   When the gdrcopy worker is running, do_gin_signal_and_trace only
 	   enqueues the work and returns. We hold off ACK and seq-num
