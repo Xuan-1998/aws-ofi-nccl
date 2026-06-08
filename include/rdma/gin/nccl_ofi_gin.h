@@ -9,6 +9,7 @@
 #include "rdma/gin/nccl_ofi_gin_resources.h"
 #include "rdma/gin/nccl_ofi_gin_types.h"
 #include "nccl_ofi_dlist.h"
+#include "nccl_ofi_spsc_ring.h"
 
 #include "nccl_ofi.h"
 #include "nccl_ofi_gdrcopy.h"
@@ -197,40 +198,6 @@ struct nccl_ofi_rdma_gin_symm_mr_handle : public nccl_ofi_gin_symm_mr_handle_t {
 	 * does not pass ginHandle to deregMrSym. Plain heap memory, no
 	 * libfabric resources. Null when the proxy path is used. */
 	void *gin_device_handle = nullptr;
-};
-
-/**
- * Single-producer / single-consumer lock-free ring used to hand
- * GIN signal-delivery work between the proxy CQ-drain thread (producer)
- * and a dedicated gdrcopy worker thread (consumer). FIFO ordering is
- * guaranteed by the SPSC contract, which preserves seq-num delivery
- * order under strong_signal_ordering.
- */
-template <typename T, uint32_t CAPACITY = 1024>
-class nccl_ofi_gin_spsc_ring {
-	T ring[CAPACITY];
-	alignas(64) std::atomic<uint32_t> head{0};
-	alignas(64) std::atomic<uint32_t> tail{0};
-public:
-	bool push(const T &entry) {
-		uint32_t h = head.load(std::memory_order_relaxed);
-		uint32_t next = (h + 1) % CAPACITY;
-		if (next == tail.load(std::memory_order_acquire)) {
-			return false;
-		}
-		ring[h] = entry;
-		head.store(next, std::memory_order_release);
-		return true;
-	}
-	bool pop(T &entry) {
-		uint32_t t = tail.load(std::memory_order_relaxed);
-		if (t == head.load(std::memory_order_acquire)) {
-			return false;
-		}
-		entry = ring[t];
-		tail.store((t + 1) % CAPACITY, std::memory_order_release);
-		return true;
-	}
 };
 
 /**
@@ -562,11 +529,12 @@ private:
 	 * gdrcopy_work_queue; the worker pops, runs do_gin_signal (the gdrcopy
 	 * read-modify-write to/from device memory), and pushes results to
 	 * gdrcopy_done_queue. The proxy drains the done queue every progress
-	 * tick. */
+	 * tick. The SPSC ring's FIFO guarantee preserves seq-num delivery
+	 * order under strong_signal_ordering. */
 	std::atomic<int> gdrcopy_thread_stop{0};
 	std::atomic<int> gdrcopy_thread_exited{0};
-	nccl_ofi_gin_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;
-	nccl_ofi_gin_spsc_ring<gin_signal_done_entry> gdrcopy_done_queue;
+	nccl_ofi_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;
+	nccl_ofi_spsc_ring<gin_signal_done_entry> gdrcopy_done_queue;
 	std::thread gdrcopy_thread;
 
 	void run_gdrcopy_worker_loop();

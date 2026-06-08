@@ -69,17 +69,20 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &r
 	resources.set_comm(local_comm_id, *this);
 	resources.increment_ref_cnt();
 
-	/* Spawn the gdrcopy worker thread. std::thread RAII wraps the
-	 * underlying pthread; failure to spawn throws std::system_error,
-	 * which we catch so the comm can fall back to running gdrcopy on
-	 * the proxy thread in do_gin_signal_and_trace. */
+	/* Spawn the gdrcopy worker thread that runs the signal-delivery
+	 * read-modify-write off the proxy CQ-drain thread. A spawn failure is
+	 * unexpected (thread/FD exhaustion); rather than silently fall back to
+	 * running gdrcopy on the proxy thread, fail comm creation so we never
+	 * run in that degraded configuration. Undo the comm registration before
+	 * rethrowing so resources teardown does not see a dangling comm. */
 	try {
 		gdrcopy_thread = std::thread(
 			&nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop, this);
 	} catch (const std::system_error &err) {
-		NCCL_OFI_WARN("Failed to spawn GIN gdrcopy worker thread: %s, "
-		              "falling back to running gdrcopy on proxy thread",
+		NCCL_OFI_WARN("Failed to spawn GIN gdrcopy worker thread: %s",
 			      err.what());
+		resources.remove_comm(local_comm_id);
+		throw;
 	}
 }
 
@@ -928,33 +931,23 @@ int nccl_ofi_rdma_gin_put_comm::do_gin_signal_and_trace(uint32_t peer_rank,
 	NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_BEGIN(dev, this, peer_rank,
 						 req->metadata.header.seq_num, req);
 
-	/* Hand the gdrcopy work off to the worker thread when running. The
-	 * proxy reaps via drain_gdrcopy_done_queue() each progress tick.
-	 * Falls back to running gdrcopy on the proxy thread if the worker
-	 * never started. */
-	if (gdrcopy_thread.joinable()) {
-		return enqueue_gdrcopy_work(peer_rank, req);
-	}
-
-	int ret = do_gin_signal(req->metadata);
-	NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, peer_rank,
-					       req->metadata.header.seq_num, req);
-	if (OFI_UNLIKELY(ret != 0)) {
-		NCCL_OFI_WARN("Failed to complete signal seq_num %lu",
-			      (unsigned long)req->metadata.header.seq_num);
-	}
-	return ret;
+	/* Hand the gdrcopy work off to the worker thread. The proxy reaps via
+	 * drain_gdrcopy_done_queue() each progress tick, which emits the
+	 * matching DELIVERY_END trace once the gdrcopy has actually landed. The
+	 * worker is spawned at comm construction (a spawn failure aborts comm
+	 * creation), so it is always running here. */
+	return enqueue_gdrcopy_work(peer_rank, req);
 }
 
-/* Push a signal-delivery work item to the gdrcopy worker. The proxy must
- * not run gdrcopy on the proxy thread if the ring is full: the worker is
- * also walking the same signal slot, and two concurrent r-m-w sequences
- * against a PCIe-mapped counter can race and lose increments. Spin
- * instead, waking the worker each iteration and draining its done ring
- * while we wait. The work ring is 1024 deep, so under normal load this
- * loop never iterates; if it does, it means a recv burst genuinely
- * outpaced gdrcopy and we want to throttle the proxy until the worker
- * catches up.
+/* Push a signal-delivery work item to the gdrcopy worker. On a full work
+ * ring the proxy must not fall back to running gdrcopy itself: the worker
+ * is the sole owner of that read-modify-write, and two concurrent r-m-w
+ * sequences against a PCIe-mapped counter can race and lose increments. We
+ * spin instead, draining the worker's done ring while we wait so it keeps
+ * making room. The ring holds nearly its full CAPACITY of entries, so under
+ * normal load this loop never iterates; if it does, a recv burst genuinely
+ * outpaced gdrcopy and throttling the proxy until the worker catches up is
+ * the behavior we want.
  *
  * The req is marked in_flight before the push so retire_completed_peer_iput_ops
  * will not advance past it, return it to the pool, or stash an ACK while
@@ -1022,9 +1015,11 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 	while (true) {
 		if (!gdrcopy_work_queue.pop(work)) {
 			/* Empty queue. After stop is set, draining to empty
-			 * means we're done; otherwise busy-poll. The hot
-			 * signal-delivery path cannot afford the futex
-			 * syscall round-trip, so the worker pegs one core. */
+			 * means we're done; otherwise busy-poll. We deliberately
+			 * busy-poll rather than block on a condition variable:
+			 * signal delivery is latency-critical and a wakeup
+			 * syscall round-trip would show up directly in the
+			 * critical path, so the worker pegs one core instead. */
 			if (gdrcopy_thread_stop.load(std::memory_order_acquire)) {
 				break;
 			}
@@ -1041,8 +1036,8 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 		done.status = status;
 		while (!gdrcopy_done_queue.push(done)) {
 			/* Done queue full: brief pause, proxy will drain on its
-			 * next tick. Both queues are sized 1024 so this is
-			 * unlikely under normal operation. */
+			 * next tick. Both rings share the same CAPACITY, so this
+			 * is unlikely under normal operation. */
 			asm volatile("" ::: "memory");
 		}
 	}
