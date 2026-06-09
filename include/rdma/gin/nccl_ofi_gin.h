@@ -9,6 +9,7 @@
 #include "rdma/gin/nccl_ofi_gin_resources.h"
 #include "rdma/gin/nccl_ofi_gin_types.h"
 #include "nccl_ofi_dlist.h"
+#include "nccl_ofi_mpsc_ring.h"
 #include "nccl_ofi_spsc_ring.h"
 
 #include "nccl_ofi.h"
@@ -18,7 +19,10 @@
 #include <bitset>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <thread>
+#include <type_traits>
+#include <vector>
 
 /**
  * Get singleton instance of the device copy context shared across all GIN communicators.
@@ -204,14 +208,40 @@ struct nccl_ofi_rdma_gin_symm_mr_handle : public nccl_ofi_gin_symm_mr_handle_t {
 };
 
 /**
- * Work descriptor enqueued by the proxy CQ-drain thread for the gdrcopy
- * worker. The signal metadata is captured by value so the recv buffer
- * can be re-armed without waiting for the worker to consume.
+ * Work descriptor enqueued by a proxy CQ-drain thread for the single
+ * process-wide gdrcopy worker.
+ *
+ * Everything the worker needs to perform the signal read-modify-write is
+ * captured here by value at enqueue time, while the producing proxy still
+ * holds its ep_lock and the comm's mr_handle_map is stable. The worker
+ * therefore never dereferences mr_handle_map (which a concurrent deregMrSym
+ * could mutate) and only touches the owning comm through `comm` to route the
+ * result to its done queue and to drop the outstanding-gdrcopy reference.
  */
 struct gin_signal_work_entry {
-	nccl_net_ofi_gin_signal_metadata_msg_t metadata;
+	/* Owning comm. Used only to push the done entry into comm's per-comm
+	   done queue and to decrement comm->outstanding_gdrcopy. Kept alive
+	   across the worker's last touch by the closeColl quiesce protocol. */
+	nccl_ofi_rdma_gin_put_comm *comm;
+
+	/* The recv req this signal belongs to; travels through to the done
+	   entry. The worker never dereferences it (status travels by value). */
 	nccl_net_ofi_gin_iputsignal_recv_req *req;
+
+	/* GDRCopy registered region for the signal counter, captured by value
+	   so the worker does not touch mr_handle_map. Null for the host-memory
+	   path (never used in practice; NCCL allocates signals in GPU memory). */
+	nccl_ofi_device_copy::RegHandle *gdr_handle;
+
+	/* Destination for the host-memory signal path (type == NCCL_PTR_HOST). */
+	uint64_t signal_base_address;
+
+	uint64_t signal_offset;
+	uint64_t signal_value;
+	int type;
+
 	uint32_t peer_rank;
+	uint16_t seq_num;
 };
 
 /**
@@ -228,6 +258,96 @@ struct gin_signal_done_entry {
 	uint32_t peer_rank;
 	uint16_t seq_num;
 	int status;
+};
+
+/* Both ring entries are copied by value through the lock-free rings, so they
+   must be trivially copyable. */
+static_assert(std::is_trivially_copyable<gin_signal_work_entry>::value,
+	      "gin_signal_work_entry must be trivially copyable for the MPSC ring");
+static_assert(std::is_trivially_copyable<gin_signal_done_entry>::value,
+	      "gin_signal_done_entry must be trivially copyable for the SPSC ring");
+
+/**
+ * Single process-wide gdrcopy worker.
+ *
+ * PR #1256 ran one worker thread per put-comm. With GIN_NCONNECTIONS proxy
+ * threads that is one gdrcopy thread per connection; this collapses them to
+ * one thread for the whole process. The worker pops signal
+ * work from a shared MPSC ring fed by every comm's proxy thread, coalesces
+ * entries that target the same signal slot into a single PCIe
+ * read-modify-write, and pushes one done entry per request back into the
+ * owning comm's per-comm SPSC done queue.
+ *
+ * Lifetime: a lazily-constructed Meyers singleton (mirrors get_device_copy()).
+ * Spawned on the first comm that needs it; runs until process teardown. There
+ * is no per-comm join — comm teardown instead quiesces via the per-comm
+ * outstanding_gdrcopy counter (see closeColl). Construction failure (thread
+ * spawn) throws, aborting the first comm's creation, so we never silently run
+ * the read-modify-write on a proxy thread (two concurrent r-m-w against a
+ * PCIe-mapped counter can lose increments).
+ */
+class nccl_ofi_gin_gdrcopy_worker {
+public:
+	/* Process singleton. Throws std::system_error if the worker thread
+	   cannot be spawned on first use. */
+	static nccl_ofi_gin_gdrcopy_worker &get();
+
+	nccl_ofi_gin_gdrcopy_worker(const nccl_ofi_gin_gdrcopy_worker &) = delete;
+	nccl_ofi_gin_gdrcopy_worker &operator=(const nccl_ofi_gin_gdrcopy_worker &) = delete;
+
+	/* Enqueue one signal-delivery work item. Multi-producer: any comm's
+	   proxy thread may call concurrently. Returns false when the shared
+	   ring is full, leaving the caller to drain its done queue and retry. */
+	bool enqueue(const gin_signal_work_entry &work)
+	{
+		return work_queue.push(work);
+	}
+
+private:
+	nccl_ofi_gin_gdrcopy_worker();
+	~nccl_ofi_gin_gdrcopy_worker();
+
+	void run_loop() NO_THREAD_SAFETY_ANALYSIS;
+
+	/* Apply one batch of work, coalescing same-slot entries into a single
+	   read-modify-write, and complete each request into its comm's done
+	   queue. Updates entries_total / gdrcopy_calls_total for fold-ratio
+	   accounting. */
+	void apply_and_complete(gin_signal_work_entry *batch, size_t n);
+
+	/* Route one completed signal to its comm's done queue. On a full done
+	   queue the entry is stashed rather than blocked on, so a slow comm
+	   cannot head-of-line block delivery for every other comm. */
+	void deliver_done(nccl_ofi_rdma_gin_put_comm *comm,
+			  const gin_signal_done_entry &done);
+
+	/* Retry stashed done entries. Skips comms whose done queue is still
+	   full (preserving per-comm FIFO) so one backed-up comm does not stall
+	   the others. */
+	void flush_done_stash();
+
+	nccl_ofi_mpsc_ring<gin_signal_work_entry> work_queue;
+	std::thread thread;
+	std::atomic<int> stop{0};
+
+	/* Done entries the worker has produced but could not yet push because
+	   the target comm's done queue was full. Owned solely by the worker
+	   thread. The paired comm pointer routes the retry and the eventual
+	   outstanding_gdrcopy decrement. */
+	struct stashed_done {
+		nccl_ofi_rdma_gin_put_comm *comm;
+		gin_signal_done_entry done;
+	};
+	std::deque<stashed_done> done_stash;
+	/* Scratch reused by flush_done_stash to mark comms blocked this pass. */
+	std::vector<nccl_ofi_rdma_gin_put_comm *> blocked_comms;
+
+	/* Fold-ratio instrumentation. entries = signal work items applied;
+	   gdrcopy_calls = distinct PCIe read-modify-writes issued after
+	   coalescing. fold ratio = entries / gdrcopy_calls. Touched only by
+	   the worker thread plus a final read after join, so plain integers. */
+	uint64_t entries_total = 0;
+	uint64_t gdrcopy_calls_total = 0;
 };
 
 /**
@@ -484,7 +604,7 @@ private:
 	   Used to wait for remaining acknowledgements on communicator close. */
 	uint32_t outstanding_ack_counter = 0;
 
-	/* --- TIER 4: signal delivery (do_gin_signal) --- */
+	/* --- TIER 4: signal delivery (build_signal_work / apply_signal_work) --- */
 	/* Map from pointers to memory registration handle. Used to look up
 	   GDRCopy handle for signal delivery.
 
@@ -514,7 +634,17 @@ private:
 	int send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, uint32_t peer_rank,
 		     uint32_t rx_consumed) REQUIRES(get_ep_lock());
 
-	int do_gin_signal(const nccl_net_ofi_gin_signal_metadata_msg_t &metadata);
+	/* Look up the signal's GDRCopy handle in mr_handle_map and fill `work`
+	   with everything the worker needs to apply the read-modify-write.
+	   Runs on the proxy under ep_lock (map stable), so the worker never
+	   touches mr_handle_map. */
+	int build_signal_work(const nccl_net_ofi_gin_signal_metadata_msg_t &metadata,
+			      gin_signal_work_entry &work) REQUIRES(get_ep_lock());
+
+	/* Apply one signal read-modify-write directly from captured work-entry
+	   fields (no mr_handle_map lookup). Used by the worker, and by the
+	   proxy itself during closeColl teardown when the worker is quiesced. */
+	static int apply_signal_work(const gin_signal_work_entry &work);
 
 	int do_gin_signal_and_trace(uint32_t peer_rank,
 				    nccl_net_ofi_gin_iputsignal_recv_req *req) REQUIRES(get_ep_lock());
@@ -531,29 +661,56 @@ private:
 
 	int retire_completed_peer_iput_ops(uint32_t peer_rank) REQUIRES(get_ep_lock());
 
-	/* --- gdrcopy worker thread (signal delivery off proxy) ---
-	 * The proxy CQ-drain thread pushes completed signal recv reqs into
-	 * gdrcopy_work_queue; the worker pops, runs do_gin_signal (the gdrcopy
-	 * read-modify-write to/from device memory), and pushes results to
-	 * gdrcopy_done_queue. The proxy drains the done queue every progress
-	 * tick. The SPSC ring's FIFO guarantee preserves seq-num delivery
-	 * order under strong_signal_ordering. */
-	std::atomic<int> gdrcopy_thread_stop{0};
-	std::atomic<int> gdrcopy_thread_exited{0};
-	nccl_ofi_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;
+	/* --- gdrcopy worker (signal delivery off proxy) ---
+	 * The proxy CQ-drain thread enqueues completed signal recv reqs into
+	 * the single process-wide nccl_ofi_gin_gdrcopy_worker (shared MPSC
+	 * ring). The worker does the gdrcopy read-modify-write and pushes a
+	 * result into this comm's own SPSC done queue, which only this comm's
+	 * proxy drains. The done queue stays single-producer (the one worker) /
+	 * single-consumer (this proxy), so SPSC FIFO still preserves per-peer
+	 * seq order under strong_signal_ordering. */
 	nccl_ofi_spsc_ring<gin_signal_done_entry> gdrcopy_done_queue;
-	std::thread gdrcopy_thread;
 
-	void run_gdrcopy_worker_loop();
+	/* Outstanding signal r-m-w handed to the worker for this comm but not
+	   yet completed back through the done queue. Incremented on the proxy
+	   under ep_lock at enqueue; decremented by the worker after it has
+	   finished touching this comm (applied the signal AND pushed the done
+	   entry). closeColl drains this to zero before deleting the comm, so
+	   the worker can never reference a freed comm. Atomic: the worker
+	   decrements without ep_lock. */
+	std::atomic<uint32_t> outstanding_gdrcopy{0};
+
+	/* Set under ep_lock at the start of closeColl teardown. Once set, the
+	   CQ-completion paths stop handing new work to the shared worker and
+	   apply any late signal synchronously on the proxy instead, so the
+	   outstanding-gdrcopy count cannot rise again after it reaches zero. */
+	std::atomic<bool> closing{false};
+
 	int enqueue_gdrcopy_work(uint32_t peer_rank,
 				 nccl_net_ofi_gin_iputsignal_recv_req *req) REQUIRES(get_ep_lock());
 
 	friend class nccl_ofi_rdma_gin_listen_comm;
+	friend class nccl_ofi_gin_gdrcopy_worker;
 
 public:
+	bool has_outstanding_gdrcopy() const
+	{
+		return outstanding_gdrcopy.load(std::memory_order_acquire) != 0;
+	}
+
+	/* Mark this comm as tearing down. After this, the CQ-completion paths
+	   apply any late signal synchronously on the proxy rather than handing
+	   it to the shared worker, so outstanding_gdrcopy cannot rise again once
+	   closeColl has drained it to zero. Called from closeColl under ep_lock
+	   intent (the store itself is atomic). */
+	void begin_closing()
+	{
+		closing.store(true, std::memory_order_release);
+	}
+
 	/* Reap completed signal-delivery work from the gdrcopy worker. Called
-	 * from ginProgress every progress tick and from the destructor while
-	 * joining the worker; both hold the ep lock, which is why we advance
+	 * from ginProgress every progress tick and from closeColl while
+	 * quiescing the worker; both hold the ep lock, which is why we advance
 	 * retire_completed_peer_iput_ops (and thus emit ACKs) from here. */
 	int drain_gdrcopy_done_queue() REQUIRES(get_ep_lock());
 
