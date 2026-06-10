@@ -935,6 +935,48 @@ int nccl_ofi_rdma_gin_put_comm::do_gin_signal_and_trace(uint32_t peer_rank,
 	return enqueue_gdrcopy_work(peer_rank, req);
 }
 
+/* Hand a pre-folded signal-delivery work item to the shared worker. The value
+ * in `work` is already the sum across the coalesced run; `gate_req` is the one
+ * recv req that carries the in-flight gate (its done entry re-runs retire).
+ * Same handoff as enqueue_gdrcopy_work but skips the per-req build (the caller
+ * already filled `work`) so the whole run costs one ring slot and one r-m-w. */
+int nccl_ofi_rdma_gin_put_comm::post_folded_signal_work(uint32_t peer_rank,
+						const gin_signal_work_entry &work_template,
+						nccl_net_ofi_gin_iputsignal_recv_req *gate_req)
+{
+	gin_signal_work_entry work = work_template;
+	work.comm = this;
+	work.req = gate_req;
+	work.peer_rank = peer_rank;
+	work.seq_num = gate_req->metadata.header.seq_num;
+
+	if (OFI_UNLIKELY(closing.load(std::memory_order_acquire))) {
+		/* Teardown path: worker is quiesced for this comm. Apply the
+		 * folded value synchronously; no handoff. */
+		gate_req->gdrcopy_status = apply_signal_work(work);
+		gate_req->gdrcopy_in_flight = false;
+		NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, peer_rank, work.seq_num, gate_req);
+		return gate_req->gdrcopy_status;
+	}
+
+	gate_req->gdrcopy_in_flight = true;
+	gate_req->gdrcopy_status = 0;
+
+	outstanding_gdrcopy.fetch_add(1, std::memory_order_relaxed);
+
+	auto &worker = nccl_ofi_gin_gdrcopy_worker::get();
+	while (!worker.enqueue(work)) {
+		int drain_ret = drain_gdrcopy_done_queue();
+		if (OFI_UNLIKELY(drain_ret != 0)) {
+			outstanding_gdrcopy.fetch_sub(1, std::memory_order_acq_rel);
+			gate_req->gdrcopy_in_flight = false;
+			return drain_ret;
+		}
+		asm volatile("" ::: "memory");
+	}
+	return 0;
+}
+
 /* Hand a signal-delivery work item to the single process-wide gdrcopy worker.
  *
  * During teardown (closing set) the worker has already been quiesced for this
@@ -1291,7 +1333,16 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 
 	/* Walk in-order delivered ops, advancing rx_consumed as we go. The
 	   sender's flow-control window opens once we send back a standalone
-	   ACK (maybe_send_ack at the end of this function). */
+	   ACK (maybe_send_ack at the end of this function).
+
+	   Producer-side coalescing (strong ordering): rather than post one
+	   gdrcopy work item per signal, we greedily fold a maximal run of
+	   consecutive ready signals targeting the SAME (base,offset) slot into
+	   a single +N read-modify-write, posted once to the worker. Signal adds
+	   commute, so summing the run's values and applying them as one r-m-w
+	   lands the counter on the same value while collapsing the run to one
+	   PCIe write and one ring slot. Only the run's last req carries the
+	   in-flight gate; its done entry re-runs retire for the whole run. */
 	while (true) {
 		auto &rank_comm = this->rank_comms[peer_rank];
 		uint16_t next_seq_num = rank_comm.next_delivered_signal_seq_num;
@@ -1320,15 +1371,120 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 			return ret;
 		}
 
-		ack_requested = ack_requested || req->is_ack_requested;
-		rank_comm.rx_consumed = gin_cursor_inc(rank_comm.rx_consumed);
-		rank_comm.next_delivered_signal_seq_num =
-			(rank_comm.next_delivered_signal_seq_num + 1) & GIN_IMM_SEQ_MASK;
-		ret = iput_signal_recv_req_completion(peer_rank, map_key, req);
+		/* Fall back to the original per-req completion path when there is
+		   nothing to fold:
+		     - weak ordering: the signal was already posted (and maybe
+		       applied) at CQ-completion time, so retire only advances; or
+		     - the req has no metadata yet (a write-only completion can mark
+		       a req segment-complete before its metadata message arrives,
+		       so signal_base_address is not populated) — the per-req path
+		       correctly skips the gdrcopy in that case.
+		   Producer-side folding only applies under strong ordering with
+		   metadata in hand, which is also the only case build_signal_work
+		   can resolve the slot. */
+		if (!strong_signal_ordering_enabled || !req->metadata_received) {
+			ack_requested = ack_requested || req->is_ack_requested;
+			rank_comm.rx_consumed = gin_cursor_inc(rank_comm.rx_consumed);
+			rank_comm.next_delivered_signal_seq_num =
+				(rank_comm.next_delivered_signal_seq_num + 1) & GIN_IMM_SEQ_MASK;
+			ret = iput_signal_recv_req_completion(peer_rank, map_key, req);
+			if (OFI_UNLIKELY(ret != 0)) {
+				return ret;
+			}
+			this->resources.return_req_to_pool(req);
+			continue;
+		}
+
+		/* Strong ordering: build the work item for this slot once, then
+		   greedily extend the run over consecutive same-slot ready
+		   signals. For each member of the run we sum its value into the
+		   fold, advance the cursor, erase it from the outstanding map and
+		   recycle it inline — the same per-req lifecycle as before, except
+		   the whole run posts a single +N work item (below) instead of K.
+
+		   Recycling reqs that the fold's gdrcopy still covers is safe for
+		   the same reason the per-signal path could recycle an in-flight
+		   req: the worker captured the folded work by value, so the done
+		   entry's req pointer is never dereferenced (status travels by
+		   value). Cursor + map are fully advanced before we post, so the
+		   drain-spin inside post_folded_signal_work can re-enter retire
+		   without reprocessing this run. */
+		gin_signal_work_entry folded {};
+		ret = build_signal_work(req->metadata, folded);
 		if (OFI_UNLIKELY(ret != 0)) {
 			return ret;
 		}
-		this->resources.return_req_to_pool(req);
+		folded.signal_value = 0;
+
+		/* First pass: extend the run over consecutive same-slot ready
+		   signals, summing values and advancing the cursor / erasing /
+		   recycling each member EXCEPT the last (gate) req. The gate req
+		   stays live until after we post, so post_folded_signal_work can
+		   set its in-flight gate before it returns to the pool — matching
+		   the original mark-in-flight-then-recycle ordering. */
+		nccl_net_ofi_gin_iputsignal_recv_req *gate_req = req;
+		uint64_t gate_key = map_key;
+		uint16_t cur_seq = next_seq_num;
+		uint64_t cur_key = map_key;
+		auto *cur_req = req;
+
+		while (true) {
+			folded.signal_value += cur_req->metadata.signal_value;
+			ack_requested = ack_requested || cur_req->is_ack_requested;
+			rank_comm.rx_consumed = gin_cursor_inc(rank_comm.rx_consumed);
+			rank_comm.next_delivered_signal_seq_num =
+				(rank_comm.next_delivered_signal_seq_num + 1) & GIN_IMM_SEQ_MASK;
+
+			/* Peek the next consecutive seq; fold only if it is ready and
+			   hits the same slot. */
+			uint16_t peek_seq = (cur_seq + 1) & GIN_IMM_SEQ_MASK;
+			uint64_t peek_key = get_req_map_key(peer_rank, peek_seq);
+			auto peek_it = this->outstanding_iput_signal_recv_reqs.find(peek_key);
+			bool extend = peek_it != this->outstanding_iput_signal_recv_reqs.end();
+			nccl_net_ofi_gin_iputsignal_recv_req *peek_req = nullptr;
+			if (extend) {
+				peek_req = peek_it->second;
+				extend = peek_req->num_seg_completions == peek_req->total_segments &&
+					 peek_req->metadata_received &&
+					 !peek_req->gdrcopy_in_flight &&
+					 peek_req->gdrcopy_status == 0 &&
+					 peek_req->metadata.signal_base_address ==
+						 folded.signal_base_address &&
+					 peek_req->metadata.signal_offset == folded.signal_offset;
+			}
+
+			if (!extend) {
+				/* cur_req is the gate; leave it in the map + live and
+				   stop. */
+				gate_req = cur_req;
+				gate_key = cur_key;
+				break;
+			}
+
+			/* cur_req is an interior member: erase + recycle it now. */
+			size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(cur_key);
+			assert_always(n_removed == 1);
+			this->resources.return_req_to_pool(cur_req);
+
+			cur_seq = peek_seq;
+			cur_key = peek_key;
+			cur_req = peek_req;
+		}
+
+		/* Post the single folded +N work item, gated on the run's last
+		   req (its done entry re-runs retire for the whole run). The gate
+		   req is still in the map and live here. */
+		ret = post_folded_signal_work(peer_rank, folded, gate_req);
+		if (OFI_UNLIKELY(ret != 0)) {
+			return ret;
+		}
+
+		/* Now retire the gate req: erase + recycle, mirroring the original
+		   post-then-recycle for an in-flight req (benign: the worker holds
+		   the folded work by value). */
+		size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(gate_key);
+		assert_always(n_removed == 1);
+		this->resources.return_req_to_pool(gate_req);
 	}
 
 	/* If the sender requested an ACK, emit a standalone ACK now. */

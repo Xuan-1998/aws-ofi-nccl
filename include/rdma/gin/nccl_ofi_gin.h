@@ -646,6 +646,14 @@ private:
 	   proxy itself during closeColl teardown when the worker is quiesced. */
 	static int apply_signal_work(const gin_signal_work_entry &work);
 
+	/* Hand a pre-folded signal-delivery work item (value already summed
+	   across the coalesced run) to the shared worker. The req carrying the
+	   in-flight gate is `gate_req`; only it is marked in_flight, since one
+	   physical gdrcopy now covers the whole run. */
+	int post_folded_signal_work(uint32_t peer_rank, const gin_signal_work_entry &work,
+				    nccl_net_ofi_gin_iputsignal_recv_req *gate_req)
+		REQUIRES(get_ep_lock());
+
 	int do_gin_signal_and_trace(uint32_t peer_rank,
 				    nccl_net_ofi_gin_iputsignal_recv_req *req) REQUIRES(get_ep_lock());
 
