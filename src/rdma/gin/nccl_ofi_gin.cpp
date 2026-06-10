@@ -4,8 +4,12 @@
 
 #include "config.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
+#include <unistd.h>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 
@@ -1002,6 +1006,7 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
 	work.req = req;
 	work.peer_rank = peer_rank;
 	work.seq_num = req->metadata.header.seq_num;
+	work.fold_count = 1; /* unfolded single signal (weak-order / no-metadata path) */
 
 	int ret = build_signal_work(req->metadata, work);
 	if (OFI_UNLIKELY(ret != 0)) {
@@ -1096,13 +1101,7 @@ nccl_ofi_gin_gdrcopy_worker::~nccl_ofi_gin_gdrcopy_worker()
 	if (thread.joinable()) {
 		thread.join();
 	}
-	if (gdrcopy_calls_total > 0) {
-		NCCL_OFI_INFO(NCCL_NET,
-			      "GIN gdrcopy worker: %lu signal entries, %lu PCIe r-m-w "
-			      "calls, fold ratio %.3f",
-			      (unsigned long)entries_total, (unsigned long)gdrcopy_calls_total,
-			      (double)entries_total / (double)gdrcopy_calls_total);
-	}
+	report_fold_stats();
 }
 
 /* Apply a batch of work items, coalescing entries that target the same signal
@@ -1123,6 +1122,7 @@ void nccl_ofi_gin_gdrcopy_worker::apply_and_complete(gin_signal_work_entry *batc
 		gin_signal_work_entry &w = batch[0];
 		int status = nccl_ofi_rdma_gin_put_comm::apply_signal_work(w);
 		++gdrcopy_calls_total;
+		record_fold(w.fold_count);
 
 		gin_signal_done_entry done;
 		done.req = w.req;
@@ -1130,7 +1130,6 @@ void nccl_ofi_gin_gdrcopy_worker::apply_and_complete(gin_signal_work_entry *batc
 		done.seq_num = w.seq_num;
 		done.status = status;
 		deliver_done(w.comm, done);
-		++entries_total;
 		return;
 	}
 
@@ -1162,7 +1161,10 @@ void nccl_ofi_gin_gdrcopy_worker::apply_and_complete(gin_signal_work_entry *batc
 
 		/* Complete every entry sharing this slot with the same status,
 		 * pushing one done entry per request into its owning comm's
-		 * done queue. */
+		 * done queue. Accumulate the group size (original signals folded
+		 * into this one PCIe write, across both the producer-side run
+		 * lengths and this worker-side same-slot merge). */
+		uint32_t group = 0;
 		for (size_t j = i; j < n; ++j) {
 			gin_signal_work_entry &member = batch[j];
 			if (member.req == nullptr) {
@@ -1183,8 +1185,85 @@ void nccl_ofi_gin_gdrcopy_worker::apply_and_complete(gin_signal_work_entry *batc
 
 			deliver_done(member.comm, done);
 
-			++entries_total;
+			group += member.fold_count;
 			member.req = nullptr;
+		}
+		record_fold(group);
+	}
+}
+
+/* Record one PCIe write that carried `group` original signals: bump the
+ * entry/call totals and the group-size histogram, and emit a cumulative
+ * report every GIN_FOLD_REPORT_INTERVAL calls (gated on OFI_NCCL_GIN_FOLD_STATS
+ * inside report_fold_stats). */
+void nccl_ofi_gin_gdrcopy_worker::record_fold(uint32_t group)
+{
+	entries_total += group;
+	int bucket;
+	if (group <= 1) {
+		bucket = 0;
+	} else if (group <= 3) {
+		bucket = 1;
+	} else if (group <= 7) {
+		bucket = 2;
+	} else if (group <= 15) {
+		bucket = 3;
+	} else if (group <= 31) {
+		bucket = 4;
+	} else {
+		bucket = 5;
+	}
+	group_size_hist[bucket]++;
+
+	if (gdrcopy_calls_total - last_report_calls >= GIN_FOLD_REPORT_INTERVAL) {
+		last_report_calls = gdrcopy_calls_total;
+		report_fold_stats();
+	}
+}
+
+void nccl_ofi_gin_gdrcopy_worker::report_fold_stats() const
+{
+	if (!ofi_nccl_gin_fold_stats() || gdrcopy_calls_total == 0) {
+		return;
+	}
+	double fold = (double)entries_total / (double)gdrcopy_calls_total;
+	NCCL_OFI_INFO(NCCL_NET,
+		      "GIN_FOLD: gdrcopy_calls=%lu entries=%lu fold=%.3fx "
+		      "groupsz[1]=%lu [2-3]=%lu [4-7]=%lu [8-15]=%lu [16-31]=%lu [32+]=%lu",
+		      (unsigned long)gdrcopy_calls_total, (unsigned long)entries_total, fold,
+		      (unsigned long)group_size_hist[0], (unsigned long)group_size_hist[1],
+		      (unsigned long)group_size_hist[2], (unsigned long)group_size_hist[3],
+		      (unsigned long)group_size_hist[4], (unsigned long)group_size_hist[5]);
+
+	/* Also append to a file when OFI_NCCL_GIN_FOLD_FILE is set, so the
+	   stats survive even if the NCCL stderr logger is filtered (e.g. under
+	   DeepEP). One line per emit; PID-tagged so multi-rank runs don't clash
+	   when the path contains %p. */
+	const char *path = getenv("OFI_NCCL_GIN_FOLD_FILE");
+	if (path != nullptr) {
+		char resolved[512];
+		const char *pct = strstr(path, "%p");
+		if (pct != nullptr) {
+			int pre = (int)(pct - path);
+			snprintf(resolved, sizeof(resolved), "%.*s%d%s", pre, path,
+				 (int)getpid(), pct + 2);
+		} else {
+			snprintf(resolved, sizeof(resolved), "%s", path);
+		}
+		FILE *f = fopen(resolved, "a");
+		if (f != nullptr) {
+			fprintf(f,
+				"GIN_FOLD gdrcopy_calls=%lu entries=%lu fold=%.3f "
+				"sz1=%lu sz2_3=%lu sz4_7=%lu sz8_15=%lu sz16_31=%lu sz32=%lu\n",
+				(unsigned long)gdrcopy_calls_total,
+				(unsigned long)entries_total, fold,
+				(unsigned long)group_size_hist[0],
+				(unsigned long)group_size_hist[1],
+				(unsigned long)group_size_hist[2],
+				(unsigned long)group_size_hist[3],
+				(unsigned long)group_size_hist[4],
+				(unsigned long)group_size_hist[5]);
+			fclose(f);
 		}
 	}
 }
@@ -1249,10 +1328,15 @@ void nccl_ofi_gin_gdrcopy_worker::flush_done_stash()
 
 void nccl_ofi_gin_gdrcopy_worker::run_loop()
 {
-	/* Drain a batch of work each iteration so same-slot entries that piled
-	 * up while the previous batch ran can be coalesced together. */
-	constexpr size_t MAX_BATCH = 64;
-	gin_signal_work_entry batch[MAX_BATCH];
+	/* Greedily drain everything currently in the work ring each iteration,
+	 * then fold same-slot entries within that batch into one gdrcopy. The
+	 * deeper the drain, the more same-slot entries land in one batch and the
+	 * higher the fold ratio — this is the 1->N compaction that pays off when
+	 * a recv burst piles many signals on the ring faster than the single
+	 * worker applies them. Sized to the work ring's capacity so one drain
+	 * can absorb a full burst. */
+	constexpr size_t MAX_BATCH = 1024;
+	static gin_signal_work_entry batch[MAX_BATCH];
 
 	while (true) {
 		/* Retry any done entries a full comm queue made us stash on a
@@ -1427,9 +1511,11 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 		uint16_t cur_seq = next_seq_num;
 		uint64_t cur_key = map_key;
 		auto *cur_req = req;
+		uint32_t run_len = 0;
 
 		while (true) {
 			folded.signal_value += cur_req->metadata.signal_value;
+			++run_len;
 			ack_requested = ack_requested || cur_req->is_ack_requested;
 			rank_comm.rx_consumed = gin_cursor_inc(rank_comm.rx_consumed);
 			rank_comm.next_delivered_signal_seq_num =
@@ -1473,7 +1559,10 @@ int nccl_ofi_rdma_gin_put_comm::retire_completed_peer_iput_ops(uint32_t peer_ran
 
 		/* Post the single folded +N work item, gated on the run's last
 		   req (its done entry re-runs retire for the whole run). The gate
-		   req is still in the map and live here. */
+		   req is still in the map and live here. fold_count records how
+		   many original signals this one work item represents, for the
+		   fold-ratio diagnostic. */
+		folded.fold_count = run_len;
 		ret = post_folded_signal_work(peer_rank, folded, gate_req);
 		if (OFI_UNLIKELY(ret != 0)) {
 			return ret;

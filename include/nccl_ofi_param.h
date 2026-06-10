@@ -406,4 +406,11 @@ OFI_NCCL_PARAM(GIN_TYPE, gin_type, "GIN_TYPE", GIN_TYPE::PROXY)
  */
 OFI_NCCL_PARAM(bool, gin_strong_signal, "GIN_STRONG_SIGNAL", true);
 
+/*
+ * Emit GIN signal-coalescing fold-ratio diagnostics from the gdrcopy worker
+ * (cumulative gdrcopy_calls / entries / fold ratio + group-size histogram,
+ * every 8192 PCIe writes and once at shutdown). Off by default; for analysis.
+ */
+OFI_NCCL_PARAM(bool, gin_fold_stats, "GIN_FOLD_STATS", false);
+
 #endif // End NCCL_OFI_PARAM_H_

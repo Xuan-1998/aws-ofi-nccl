@@ -242,6 +242,13 @@ struct gin_signal_work_entry {
 
 	uint32_t peer_rank;
 	uint16_t seq_num;
+
+	/* Number of original iputSignals this entry already represents: the
+	   producer folds a run of consecutive same-slot signals into one +N
+	   work item and records the run length here. Used only for fold-ratio
+	   accounting (true entries = sum of fold_count), so the diagnostic
+	   counts real signals rather than post-fold work items. */
+	uint32_t fold_count;
 };
 
 /**
@@ -342,12 +349,26 @@ private:
 	/* Scratch reused by flush_done_stash to mark comms blocked this pass. */
 	std::vector<nccl_ofi_rdma_gin_put_comm *> blocked_comms;
 
-	/* Fold-ratio instrumentation. entries = signal work items applied;
-	   gdrcopy_calls = distinct PCIe read-modify-writes issued after
-	   coalescing. fold ratio = entries / gdrcopy_calls. Touched only by
-	   the worker thread plus a final read after join, so plain integers. */
+	/* Fold-ratio instrumentation (same definitions as the GIN_QDEPTH
+	   diagnostic). entries_total = original iputSignals applied (summed via
+	   each work entry's fold_count, so producer-side folding is counted);
+	   gdrcopy_calls_total = distinct PCIe read-modify-writes issued. Fold
+	   ratio = entries / gdrcopy_calls. group_size_hist buckets each PCIe
+	   write by how many original signals it carried (1, 2-3, 4-7, 8-15,
+	   16-31, 32+). Touched only by the worker thread plus a final read after
+	   join, so plain integers. Emitted every GIN_FOLD_REPORT_INTERVAL calls
+	   and once at shutdown when OFI_NCCL_GIN_FOLD_STATS is set. */
+	static constexpr int GROUP_SIZE_BUCKETS = 6;
+	static constexpr uint64_t GIN_FOLD_REPORT_INTERVAL = 8192;
 	uint64_t entries_total = 0;
 	uint64_t gdrcopy_calls_total = 0;
+	uint64_t group_size_hist[GROUP_SIZE_BUCKETS] = {0};
+	uint64_t last_report_calls = 0;
+
+	/* Record one PCIe write that carried `group` original signals. */
+	void record_fold(uint32_t group);
+	/* Emit the cumulative fold-ratio line + histogram. */
+	void report_fold_stats() const;
 };
 
 /**
