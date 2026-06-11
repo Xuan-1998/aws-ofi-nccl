@@ -80,3 +80,4 @@ m4/lt~obsolete.m4
 Makefile
 install/
 .vscode/
+tests/functional/gin_rate

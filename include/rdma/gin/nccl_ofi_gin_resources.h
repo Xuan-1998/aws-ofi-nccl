@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <vector>
 #include <unordered_map>
+#include <atomic>
+#include <ctime>
 
 #include "rdma/gin/nccl_ofi_gin_reqs.h"
 #include "rdma/gin/nccl_ofi_gin_types.h"
@@ -105,6 +107,33 @@ public:
 	void close_ofi_eps();
 
 	std::mutex ep_lock;
+
+	/* --- per-thread completion-rate instrumentation ---
+	 * One GIN connection == one progress thread == one endpoint == one
+	 * of these objects, so these counters are per-proxy-thread. TX =
+	 * locally-completed sends/writes (write + metadata-send + ack-send);
+	 * RX = inbound completions (remote-write-immediate + metadata/ack
+	 * recv). reap_ns is the wall time spent classifying+dispatching CQEs
+	 * in gin_process_completions. Dumped once at endpoint teardown. */
+	std::atomic<uint64_t> tx_completions{0};
+	std::atomic<uint64_t> rx_completions{0};
+	std::atomic<uint64_t> reap_ns{0};
+	std::atomic<uint64_t> progress_cqe_batches{0};
+	/* Wall span of the active window: first and last CQE service
+	 * timestamps (CLOCK_MONOTONIC ns). Reuse the clocks already
+	 * taken around the reap loop, so no extra clock_gettime cost.
+	 * span = last - first; busy_fraction = reap_ns / span. */
+	uint64_t first_cqe_ns{0};
+	uint64_t last_cqe_ns{0};
+	/* Burst-aware active time: sum of reap windows plus inter-batch
+	 * gaps shorter than the burst threshold. Excludes long idle gaps
+	 * (e.g. bench_kineto's ~10ms sleeps) so active_compl_per_s reflects
+	 * the real in-dispatch flow rate, not the whole-job average. */
+	uint64_t active_ns{0};
+	uint64_t prev_batch_end_ns{0};
+
+	/* Emit the GIN_RATE_FINAL summary line. */
+	void dump_completion_rate_stats();
 
 private:
 	nccl_net_ofi_domain_t &domain;

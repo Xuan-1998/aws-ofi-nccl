@@ -33,6 +33,7 @@ xj_recv_set(nccl_ofi_gin_peer_rank_info &p, uint16_t seq,
 #include "nccl_ofi_tracepoint.h"
 
 #include <vector>
+#include <cstdlib>
 
 struct gin_connect_handle {
 	/* Number of rails */
@@ -115,6 +116,35 @@ nccl_ofi_rdma_gin_put_comm::~nccl_ofi_rdma_gin_put_comm()
 	}
 	/* Drain any leftover done-queue entries (best effort). */
 	drain_gdrcopy_done_queue();
+
+	/* FINAL fold-rate dump (unconditional, WARN so it prints without NCCL_DEBUG).
+	   Runs from closeColl->delete before process exit. */
+	{
+		uint64_t gc = gdrcopy_calls.load();
+		uint64_t ep = entries_processed.load();
+		char gsbuf[256] = {0}; int goff = 0;
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = group_size_hist[i].load();
+			int n = snprintf(gsbuf + goff, sizeof(gsbuf) - goff, "%lu ", (unsigned long)b);
+			if (n < 0 || n >= (int)(sizeof(gsbuf) - goff)) break;
+			goff += n;
+		}
+		char qdbuf[256] = {0}; int qoff = 0;
+		for (int i = 0; i < 16; ++i) {
+			uint64_t b = qdepth_hist[i].load();
+			int n = snprintf(qdbuf + qoff, sizeof(qdbuf) - qoff, "%lu ", (unsigned long)b);
+			if (n < 0 || n >= (int)(sizeof(qdbuf) - qoff)) break;
+			qoff += n;
+		}
+		if (gc > 0) {
+			NCCL_OFI_WARN("GIN_FOLD_FINAL comm=%p gdrcopy_calls=%lu entries=%lu "
+			              "fold_ratio_x1e6=%lu outer_pops=%lu "
+			              "groupsz[1,2-3,4-7,8-15,...]=%s qdepth[0-1,2-3,4-7,...]=%s",
+			              (void*)this, (unsigned long)gc, (unsigned long)ep,
+			              (unsigned long)((ep * 1000000ULL) / (gc ? gc : 1)),
+			              (unsigned long)qdepth_outer_pops.load(), gsbuf, qdbuf);
+		}
+	}
 
 #if HAVE_NVTX_TRACING
 	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
@@ -830,7 +860,8 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
 int nccl_ofi_rdma_gin_put_comm::drain_gdrcopy_done_queue()
 {
 	uint64_t prev = qdepth_drain_calls.fetch_add(1, std::memory_order_relaxed);
-	if ((prev & 0x1FFF) == 0 && prev > 0) {
+	static const bool qdepth_periodic = (getenv("GIN_QDEPTH_PERIODIC") != nullptr);
+	if (qdepth_periodic && (prev & 0x1F) == 0 && prev > 0) {
 		uint64_t outer_pops = qdepth_outer_pops.load();
 		char qdbuf[256] = {0}; int off = 0;
 		for (int i = 0; i < 16; ++i) {
@@ -1125,7 +1156,6 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 				metadata_msg->header.ack_count);
 	}
 
-	uint64_t map_key = get_req_map_key(peer_rank, msg_seq_num);
 
 	nccl_net_ofi_gin_iputsignal_recv_req *req = xj_recv_get(rank_comms[peer_rank], msg_seq_num);
 	if (req == nullptr) {
@@ -1189,7 +1219,6 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data
 	bool is_ack_requested = GIN_IMM_GET_ACK_REQUESTED(cq_entry->data);
 
 	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
-	uint64_t map_key = get_req_map_key(peer_rank, msg_seq_num);
 
 	int ret = 0;
 

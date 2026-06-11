@@ -30,8 +30,49 @@ nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg
 	this->scheduler = new nccl_net_ofi_threshold_scheduler(this->num_rails);
 }
 
+void nccl_ofi_rdma_gin_ep_t::dump_completion_rate_stats()
+{
+	uint64_t tx = tx_completions.load(std::memory_order_relaxed);
+	uint64_t rx = rx_completions.load(std::memory_order_relaxed);
+	uint64_t total = tx + rx;
+	if (total == 0) {
+		return;
+	}
+	uint64_t ns = reap_ns.load(std::memory_order_relaxed);
+	uint64_t batches = progress_cqe_batches.load(std::memory_order_relaxed);
+	/* ns per completion handled, and per TX+RX pair (the 1us target). */
+	uint64_t ns_per_compl = ns / total;
+	uint64_t pairs = total / 2 ? total / 2 : 1;
+	uint64_t busy_ns_per_pair = ns / pairs;
+	uint64_t span_ns = (last_cqe_ns > first_cqe_ns) ?
+		(last_cqe_ns - first_cqe_ns) : 0;
+	/* Saturated (idle-excluded) and achieved (span, idle-included)
+	 * completion rates, in completions/sec, scaled to avoid float. */
+	uint64_t sat_compl_per_s = ns ? (total * 1000000000ULL) / ns : 0;
+	uint64_t ach_compl_per_s = span_ns ? (total * 1000000000ULL) / span_ns : 0;
+	uint64_t busy_pct = span_ns ? (ns * 100ULL) / span_ns : 0;
+	uint64_t act_ns = active_ns;
+	uint64_t active_compl_per_s = act_ns ? (total * 1000000000ULL) / act_ns : 0;
+	uint64_t active_pct = span_ns ? (act_ns * 100ULL) / span_ns : 0;
+	NCCL_OFI_WARN("GIN_RATE_FINAL ep=%p tx=%lu rx=%lu total=%lu reap_ns=%lu "
+	              "span_ns=%lu active_ns=%lu busy_pct=%lu active_pct=%lu "
+	              "ns_per_completion=%lu busy_ns_per_txrx_pair=%lu "
+	              "sat_compl_per_s=%lu active_compl_per_s=%lu "
+	              "achieved_compl_per_s=%lu cqe_batches=%lu",
+	              (void *)this, (unsigned long)tx, (unsigned long)rx,
+	              (unsigned long)total, (unsigned long)ns,
+	              (unsigned long)span_ns, (unsigned long)act_ns,
+	              (unsigned long)busy_pct, (unsigned long)active_pct,
+	              (unsigned long)ns_per_compl, (unsigned long)busy_ns_per_pair,
+	              (unsigned long)sat_compl_per_s,
+	              (unsigned long)active_compl_per_s,
+	              (unsigned long)ach_compl_per_s, (unsigned long)batches);
+}
+
 nccl_ofi_rdma_gin_ep_t::~nccl_ofi_rdma_gin_ep_t()
 {
+	dump_completion_rate_stats();
+
 	if (scheduler) {
 		delete scheduler;
 		scheduler = nullptr;
@@ -44,7 +85,19 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_completions(struct fi_cq_data_entry *cq_
 {
 	int ret = 0;
 
+	/* Per-thread reap timing + TX/RX classification. */
+	struct timespec reap_start;
+	clock_gettime(CLOCK_MONOTONIC, &reap_start);
+	uint64_t tx_seen = 0;
+	uint64_t rx_seen = 0;
+
 	for (uint64_t comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
+		uint64_t flags = cq_entry[comp_idx].flags;
+		if (flags & (FI_RECV | FI_REMOTE_WRITE)) {
+			rx_seen++;
+		} else if (flags & (FI_SEND | FI_WRITE)) {
+			tx_seen++;
+		}
 		void *op_ctx = cq_entry[comp_idx].op_context;
 
 		if (OFI_UNLIKELY(op_ctx == NULL)) {
@@ -64,6 +117,39 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_completions(struct fi_cq_data_entry *cq_
 			return ret;
 		}
 	}
+
+	struct timespec reap_end;
+	clock_gettime(CLOCK_MONOTONIC, &reap_end);
+	uint64_t elapsed_ns =
+		(uint64_t)(reap_end.tv_sec - reap_start.tv_sec) * 1000000000ULL +
+		(uint64_t)(reap_end.tv_nsec - reap_start.tv_nsec);
+	uint64_t start_ns =
+		(uint64_t)reap_start.tv_sec * 1000000000ULL + (uint64_t)reap_start.tv_nsec;
+	uint64_t end_ns =
+		(uint64_t)reap_end.tv_sec * 1000000000ULL + (uint64_t)reap_end.tv_nsec;
+	/* Single-threaded per endpoint (its own progress thread), so these
+	 * plain stores need no synchronization with respect to each other. */
+	if (first_cqe_ns == 0) {
+		first_cqe_ns = start_ns;
+	}
+	last_cqe_ns = end_ns;
+	/* Burst-aware active accumulation. GAP_THRESHOLD_NS separates a
+	 * dense dispatch burst from benchmark idle. 50us is far above the
+	 * inter-completion spacing at >1M/s (<1us) yet far below the ~10ms
+	 * bench_kineto sleep. */
+	constexpr uint64_t GAP_THRESHOLD_NS = 50000;
+	if (prev_batch_end_ns != 0) {
+		uint64_t gap = start_ns - prev_batch_end_ns;
+		if (gap < GAP_THRESHOLD_NS) {
+			active_ns += gap;
+		}
+	}
+	active_ns += elapsed_ns;
+	prev_batch_end_ns = end_ns;
+	reap_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+	tx_completions.fetch_add(tx_seen, std::memory_order_relaxed);
+	rx_completions.fetch_add(rx_seen, std::memory_order_relaxed);
+	progress_cqe_batches.fetch_add(1, std::memory_order_relaxed);
 
 	return 0;
 }
