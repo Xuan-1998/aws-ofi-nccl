@@ -269,9 +269,9 @@ struct gin_signal_work_entry {
 	uint64_t signal_value;
 	int type;
 
-	/* Virtual address of the signal counter, for paths that use a CPU
-	   atomic: host-NUMA segments within a CUDA MR (gdr_handle == nullptr),
-	   or the NCCL_PTR_HOST type. */
+	/* Virtual address of the signal counter. The worker keys the values a
+	   batch wrote on it, and the CPU-atomic paths write through it: host-NUMA
+	   segments within a CUDA MR (gdr_handle == nullptr) and NCCL_PTR_HOST. */
 	uintptr_t host_signal_va;
 
 	/* True when the MR was registered with NCCL_NET_MR_FLAG_SIGNAL_NEVER_RESET.
@@ -382,6 +382,10 @@ private:
 	std::deque<deferred_done> done_entries;
 	/* Scratch reused by flush_done_entries to mark comms blocked this pass. */
 	std::vector<nccl_ofi_rdma_gin_put_comm *> blocked_comms;
+
+	/* Values the current batch wrote to resettable signal slots, by signal
+	   VA (see apply_signal_work). Cleared per batch. */
+	std::unordered_map<uintptr_t, uint64_t> written_values;
 };
 
 /**
@@ -711,8 +715,10 @@ private:
 
 	/* Apply one signal read-modify-write directly from captured work-entry
 	   fields (no mr_handle_map lookup). Used by the worker, and by the
-	   proxy itself during closeColl teardown when the worker is quiesced. */
-	static int apply_signal_work(const gin_signal_work_entry &work);
+	   proxy itself during closeColl teardown when the worker is quiesced.
+	   `written` holds the values the current batch wrote, by signal VA. */
+	static int apply_signal_work(const gin_signal_work_entry &work,
+				     std::unordered_map<uintptr_t, uint64_t> &written);
 
 	/* Hand a signal-delivery work item to the single process-wide gdrcopy
 	   worker. `gate_req` is the req that carries the in-flight gate (for a
