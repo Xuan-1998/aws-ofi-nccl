@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <thread>
 #include <vector>
 
 static inline ncclResult_t
@@ -277,6 +280,137 @@ int main(int argc, char *argv[])
 	NCCL_OFI_INFO(NCCL_NET, "=== Verifying iput/iputSignal result ===");
 	OFINCCLCHECK(verify_buff(rank, put_buff, send_val));
 	OFINCCLCHECK(verify_buff(rank, put_signal_buff, send_val));
+
+	/*
+	 * Liveness check for the host proxy's signal hand-off. On a full gdrcopy
+	 * work ring the proxy spins inside rmaProgress until the worker makes
+	 * room, which holds only while the worker never waits on the proxy. Rank 0
+	 * sends rank 1 one signal that carries a large put, then thousands of
+	 * signals to device memory slots. A peer's signals are delivered in order,
+	 * so the small ones wait until the put has landed and are then handed to
+	 * the worker in one pass, more than the work ring and the done queue hold
+	 * together, each a PCIe read-modify-write for the worker. A watchdog
+	 * thread fails the test when one progress call has not returned after
+	 * SPIN_CALL_LIMIT_SECONDS, so a stuck spin reports instead of hanging
+	 * until the job times out.
+	 */
+	const size_t SPIN_SLOTS = 512;
+	const size_t SPIN_SIGNALS = 4096;
+	const size_t SPIN_HEAD_SIZE = 1ULL << 30;
+	const size_t SPIN_MAX_OUTSTANDING = 256;
+	const int SPIN_CALL_LIMIT_SECONDS = 20;
+	const int SPIN_TIMEOUT_SECONDS = 60;
+	void *spin_buff = nullptr;
+	void *spin_mhandle = nullptr;
+	OFINCCLCHECK(alloc_and_reg_buff(extRma, collComm, SPIN_SLOTS * sizeof(uint64_t),
+					buffer_type, 0, &spin_buff, &spin_mhandle));
+	void *spin_head_buff = nullptr;
+	void *spin_head_mhandle = nullptr;
+	OFINCCLCHECK(alloc_and_reg_buff(extRma, collComm, SPIN_HEAD_SIZE, buffer_type, 0,
+					&spin_head_buff, &spin_head_mhandle));
+	int spin_failed = 0;
+
+	MPI_Barrier(MPI_COMM_WORLD);
+
+	if (rank == 0) {
+		std::deque<void *> request_deque;
+		for (size_t n = 0; n < SPIN_SIGNALS; ++n) {
+			void *request = nullptr;
+			void *data_mhandle = n == 0 ? spin_head_mhandle : nullptr;
+			size_t size = n == 0 ? SPIN_HEAD_SIZE : 0;
+			OFINCCLCHECK(extRma->iputSignal(rmaCtx, 0, 0, data_mhandle, size, 0,
+							data_mhandle, 1,
+							(n % SPIN_SLOTS) * sizeof(uint64_t),
+							spin_mhandle, 1, NCCL_NET_SIGNAL_OP_INC,
+							true, 0, &request));
+			assert(request != nullptr);
+			request_deque.push_back(request);
+			while (request_deque.size() >= SPIN_MAX_OUTSTANDING) {
+				OFINCCLCHECK(poll_request_completion(extRma, request_deque,
+								    collComm, rmaCtx));
+			}
+		}
+		while (!request_deque.empty()) {
+			OFINCCLCHECK(poll_request_completion(extRma, request_deque, collComm,
+							    rmaCtx));
+		}
+	} else if (rank == 1) {
+		auto now_ns = []() -> int64_t {
+			return std::chrono::duration_cast<std::chrono::nanoseconds>(
+				       std::chrono::steady_clock::now().time_since_epoch())
+				.count();
+		};
+		std::atomic<int64_t> call_start{0};
+		std::atomic<uint64_t> landed{0};
+		std::atomic<bool> stop_watchdog{false};
+		std::thread watchdog([&]() {
+			const int64_t limit = SPIN_CALL_LIMIT_SECONDS * 1000000000LL;
+			while (!stop_watchdog.load()) {
+				int64_t start = call_start.load();
+				if (start != 0 && now_ns() - start > limit) {
+					NCCL_OFI_WARN("rmaProgress has not returned after %d s, "
+						      "with %lu of %zu signals landed",
+						      SPIN_CALL_LIMIT_SECONDS,
+						      (unsigned long)landed.load(), SPIN_SIGNALS);
+					fflush(nullptr);
+					std::_Exit(1);
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			}
+		});
+		std::vector<uint64_t> slots(SPIN_SLOTS);
+		int64_t deadline = now_ns() + SPIN_TIMEOUT_SECONDS * 1000000000LL;
+		int64_t next_read = 0;
+		ncclResult_t spin_res = ncclSuccess;
+		while (spin_res == ncclSuccess && landed.load() != SPIN_SIGNALS &&
+		       now_ns() < deadline) {
+			call_start.store(now_ns());
+			spin_res = extRma->rmaProgress(rmaCtx);
+			call_start.store(0);
+			if (spin_res != ncclSuccess || now_ns() < next_read) {
+				continue;
+			}
+			if (cudaMemcpy(slots.data(), spin_buff, SPIN_SLOTS * sizeof(uint64_t),
+				       cudaMemcpyDefault) != cudaSuccess) {
+				spin_res = ncclUnhandledCudaError;
+				break;
+			}
+			uint64_t sum = 0;
+			for (uint64_t v : slots) {
+				sum += v;
+			}
+			landed.store(sum);
+			next_read = now_ns() + 1000000;
+		}
+		stop_watchdog.store(true);
+		watchdog.join();
+		OFINCCLCHECK(spin_res);
+		if (landed.load() != SPIN_SIGNALS) {
+			NCCL_OFI_WARN("Hand-off check timed out after %d s with %lu of %zu "
+				      "signals landed",
+				      SPIN_TIMEOUT_SECONDS, (unsigned long)landed.load(),
+				      SPIN_SIGNALS);
+			spin_failed = 1;
+		}
+	}
+
+	MPI_Ibarrier(MPI_COMM_WORLD, &barrier_req);
+	barrier_done = 0;
+	while (!barrier_done) {
+		OFINCCLCHECK(extRma->rmaProgress(rmaCtx));
+		MPI_Test(&barrier_req, &barrier_done, MPI_STATUS_IGNORE);
+	}
+	MPI_Allreduce(MPI_IN_PLACE, &spin_failed, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+	if (spin_failed) {
+		MPI_Finalize();
+		return ncclSystemError;
+	}
+	NCCL_OFI_INFO(NCCL_NET, "=== Verified hand-off of %zu signals ===", SPIN_SIGNALS);
+
+	OFINCCLCHECK(extRma->deregMrSym(collComm, spin_head_mhandle));
+	OFINCCLCHECK(extRma->deregMrSym(collComm, spin_mhandle));
+	OFINCCLCHECK(deallocate_buffer(spin_head_buff, buffer_type));
+	OFINCCLCHECK(deallocate_buffer(spin_buff, buffer_type));
 
 	/*
 	 * Signal order check for the host proxy. Rank 0 sends rank 1 rounds of
