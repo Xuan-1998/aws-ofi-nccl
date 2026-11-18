@@ -20,7 +20,7 @@
 #include <system_error>
 #include <vector>
 
-/* Max signal work items the gdrcopy worker drains per pass. */
+/* Max signal work items the gdrcopy worker drains and folds per pass. */
 #define OFI_NCCL_MAX_GDR_COPY_BATCH 512
 
 struct gin_connect_handle {
@@ -1483,15 +1483,25 @@ nccl_ofi_gin_gdrcopy_worker::~nccl_ofi_gin_gdrcopy_worker()
 
 /* Apply a batch of work items in ring order. The ring holds each comm's
  * entries in the order its proxy handed them off, so applying in order keeps
- * each peer's signals in order. One done entry is pushed per request, after
- * the whole batch is applied. */
+ * each peer's signals in order. An entry that hits the same slot as the next
+ * entry is folded into it, which moves no signal past another. One done
+ * entry is pushed per request, after the whole batch is applied. */
 void nccl_ofi_gin_gdrcopy_worker::apply_and_complete(gin_signal_work_entry *batch, size_t n)
 {
 	int status[OFI_NCCL_MAX_GDR_COPY_BATCH];
+	size_t first = 0;
 
 	assert(n <= OFI_NCCL_MAX_GDR_COPY_BATCH);
 	for (size_t i = 0; i < n; ++i) {
-		status[i] = nccl_ofi_rdma_gin_put_comm::apply_signal_work(batch[i]);
+		if (i + 1 < n && batch[i + 1].comm == batch[i].comm &&
+		    batch[i + 1].host_signal_va == batch[i].host_signal_va) {
+			batch[i + 1].signal_value += batch[i].signal_value;
+			continue;
+		}
+		int ret = nccl_ofi_rdma_gin_put_comm::apply_signal_work(batch[i]);
+		for (; first <= i; ++first) {
+			status[first] = ret;
+		}
 	}
 	for (size_t i = 0; i < n; ++i) {
 		gin_signal_done_entry done;
@@ -1564,8 +1574,9 @@ void nccl_ofi_gin_gdrcopy_worker::flush_done_entries()
 void nccl_ofi_gin_gdrcopy_worker::run_loop()
 {
 	/* Drain up to OFI_NCCL_MAX_GDR_COPY_BATCH work items each iteration and hand
-	 * them to apply_and_complete. static (not on the stack) because the buffer
-	 * is large and the worker is the sole thread touching it. */
+	 * them to apply_and_complete, which coalesces adjacent same-slot entries
+	 * within the batch. static (not on the stack) because the buffer is large
+	 * and the worker is the sole thread touching it. */
 	static gin_signal_work_entry batch[OFI_NCCL_MAX_GDR_COPY_BATCH];
 
 	while (true) {
